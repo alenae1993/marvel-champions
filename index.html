@@ -401,7 +401,7 @@ b.hascard { text-decoration: underline dotted; text-underline-offset: 3px; }
 @keyframes dmgpop { 0% { opacity: 0; transform: translate(-50%, -20%) scale(.5); } 25% { opacity: 1; transform: translate(-50%, -50%) scale(1.3); } 70% { opacity: 1; transform: translate(-50%, -70%) scale(1.05); } 100% { opacity: 1; transform: translate(-50%, -75%) scale(1); } }
 @keyframes boostin { from { opacity: 0; transform: rotateY(90deg); } }
 @keyframes pulsevs { to { transform: scale(1.15); } }
-@media (max-width: 700px) { .clash-row { flex-direction: column-reverse; } .clash-vs { transform: rotate(90deg); } @keyframes lunge { 45% { transform: translateY(60px) scale(1.06); } } }
+@media (max-width: 700px) { .clash-row { gap: 6px; } .clash-vs { font-size: 26px; } }
 
 /* aviso de efecto que se activa */
 .clash-wrap.trig { background: radial-gradient(ellipse at center, rgba(40, 20, 70, .9), rgba(5, 6, 12, .93)); }
@@ -616,6 +616,29 @@ b.hascard { text-decoration: underline dotted; text-underline-offset: 3px; }
 .cfm-msg { font-size: 15px; line-height: 1.45; }
 .cfm-btns { display: flex; gap: 8px; justify-content: flex-end; flex-wrap: wrap; }
 .cfm-btns .btn { min-width: 96px; }
+/* pantallas a pantalla completa en el celular: se pueden desplazar y el botón queda siempre visible */
+@media (max-width: 600px) {
+  .clash-wrap { overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; place-items: start center; padding: 14px 10px 0; }
+  .clash-wrap.phasewrap { place-items: center; padding-bottom: 14px; }
+  .clash-wrap .row:has(> .btn.primary) { position: sticky; bottom: 0; z-index: 5; width: 100%; margin-top: 8px; justify-content: center; padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)); background: linear-gradient(180deg, rgba(5, 6, 12, 0), rgba(5, 6, 12, .92) 35%); }
+  .clash-wrap .row:has(> .btn.primary) .btn.primary { flex: 1; max-width: 360px; padding: 13px 16px; font-size: 16px; }
+  .clash-wrap .row:has(> .btn.primary) .muted { display: none; }
+  .st-row { flex-direction: row !important; gap: 8px; }
+  .st-arrow { transform: none !important; font-size: 30px; }
+  .st-card { width: 38vw; }
+  .stagefx.main .st-card { width: 42vw; }
+  .st-title { font-size: 28px; }
+  .st-sub { font-size: 15px; }
+}
+@media (max-width: 600px) {
+  .clash { max-height: none; overflow: visible; gap: 10px; }
+  .clash-title { font-size: 26px; }
+  .clash-card { width: 34vw; }
+  .clash-side.left .clash-card { width: 36vw; }
+  .clash-card.boost { width: 18vw; }
+  .clash-cards { flex-wrap: wrap; justify-content: center; gap: 6px; }
+  .clash-card .sname { font-size: 11px; }
+}
 
 </style>
 </head>
@@ -2699,7 +2722,7 @@ class Game {
   snapshot() {
     const s = {};
     for (const k of ['nextId', 'C', 'Z', 'players', 'round', 'phase', 'first', 'active', 'mods', 'traitMods', 'limits',
-      'accelTokens', 'over', 'logs', 'villainStages', 'vIdx', 'mainStages', 'mIdx', 'cfg']) s[k] = this[k];
+      'accelTokens', 'over', 'logs', 'villainStages', 'vIdx', 'mainStages', 'mIdx', 'cfg', 'blankTech', 'techRound']) s[k] = this[k];
     return JSON.parse(JSON.stringify(s));
   }
   static fromSnapshot(s, io) {
@@ -2707,6 +2730,8 @@ class Game {
     Object.assign(g, JSON.parse(JSON.stringify(s)));
     g.busy = false;
     g.over = null;
+    // cartas con «Usos» que quedaron en juego sin contadores (partidas guardadas con versiones anteriores)
+    for (const ci of g.allInPlay()) { const f = g.fx(ci); if (f.uses && !ci.ctr && !(ci.x && ci.x.usesMax)) { ci.ctr = f.uses; ci.x = ci.x || {}; ci.x.usesMax = f.uses; } }
     return g;
   }
 }
@@ -3304,9 +3329,10 @@ function costOf(c, info) {
 const ABIL_RE = /^(?:(.{1,60}?)\s+[—–-]\s+)?(\[star\]\s*)?(Hero Action|Alter-Ego Action|Action|Hero Interrupt|Hero Response|Alter-Ego Response|Interrupt|Response|Forced Response|Forced Interrupt|When Revealed \((?:Hero|Alter-Ego)\)|When Revealed|When Defeated|Hero Resource|Resource|Boost|Setup|Special|When Completed)\s*(?:\((attack|thwart|defense|defence)\))?\s*:\s*(.*)$/i;
 
 function parseCard(d) {
-  const fx = { status: 'auto', kw: parseKeywords(d.textEn), abilities: [], on: {}, parsed: true, notes: [] };
+  // una frase de palabras clave seguida de una habilidad en la misma línea («Uses (3 ...). <b>Hero Resource:</b> ...») se separa en dos líneas
+  const text = (d.textEn || '').replace(/\.\s*(<b>)/g, '.\n$1');
+  const fx = { status: 'auto', kw: parseKeywords(text), abilities: [], on: {}, parsed: true, notes: [] };
   if (fx.kw.uses) fx.uses = fx.kw.uses;
-  const text = d.textEn || '';
   if (!text.trim()) return fx;
   let ok = 0, bad = 0, semi = 0;
   const info = { name: d.name, nameEn: d.nameEn || '', code: d.code, identityNames: [], type: d.type, fac: d.fac };
@@ -6747,6 +6773,11 @@ R('16176', { heroOnly: true, play: async (g, ci, p) => {
       left -= k;
     }
   } });
+})(typeof window !== 'undefined' ? window : globalThis);
+(function (root) {
+  const L = root.MC_FX.L;
+  root.MC_FX.register('05017', { on: { wouldTakeDamage: [{ optional: true, label: 'evitar 1 y dañar 1', cost: { uses: 1 }, cond: (g, ci, ctx, p) => ctx.target === g.idOf(p) && ctx.n > 0 && ci.ctr > 0,
+    run: async (g, ci, ctx, p) => { ctx.n -= 1; if (ctx.n <= 0) ctx.prevented = true; g.log('Barrera de energía: se evita 1 de daño.'); await L.dmgEnemy(g, p, 1, { title: 'Barrera de energía: 1 de daño a un enemigo' }); } }] } });
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
