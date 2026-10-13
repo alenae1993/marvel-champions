@@ -5466,7 +5466,7 @@ R('04151', {
   whenRevealedAE: async (g, ci, p) => { const was = id(g, p).conf > 0; await g.confuse(id(g, p)); await g.placeThreat(g.main(), was ? 2 : 1); },
   whenRevealedHero: async (g, ci, p) => { const was = id(g, p).stun > 0; await g.stun(id(g, p)); await g.damage(id(g, p), was ? 2 : 1, { source: 'Granada de conmoción' }); },
 });
-R('04154', { whenDefeated: async (g) => { for (const q of g.order()) { const c = await g.searchEncounter((d) => d.type === 'minion' && (d.traitsEn || '').includes('Hydra')); if (c) await g.engageMinion(c, q, { cancelWR: true }); } } });
+R('04154', { whenDefeated: async (g) => { for (const q of g.order()) { const c = await g.searchEncounter((d) => d.type === 'minion' && (d.traitsEn || '').includes('Hydra')); if (c) await g.engageMinion(c, q, { cancelWR: true }); else g.log('Patrulla de Hydra: no queda ningún esbirro Hydra en el mazo ni en el descarte de encuentros para ' + q.name + '.'); } } });
 
 // ===================== ARCHIENEMIGOS =====================
 R('04026', obligation('Clint Barton', 'Descartar el Arco de Ojo de Halcón de juego', async (g, p) => { const b = g.controlled(p).find((c) => nm(g, c) === "Hawkeye's Bow"); if (b) await g.discard(b); }));
