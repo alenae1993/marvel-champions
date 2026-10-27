@@ -697,6 +697,18 @@ b.hascard { text-decoration: underline dotted; text-underline-offset: 3px; }
 .coach p { margin: 8px 0; }
 .coachfab { position: fixed; left: 16px; bottom: 16px; z-index: 8000; box-shadow: 0 6px 18px rgba(0,0,0,.5); }
 .board.withhand ~ .coachfab, .withhand .coachfab { bottom: 170px; }
+/* lección guiada */
+.gpanel { position: fixed; right: 12px; top: 132px; z-index: 8500; width: min(380px, calc(100vw - 24px)); background: #10261a; border: 2px solid #2ecc71; border-radius: 12px; padding: 10px 14px; box-shadow: 0 8px 24px rgba(0,0,0,.55); font-size: 14px; line-height: 1.35; }
+.gpanel p { margin: 6px 0; }
+.gpanel.wait { border-color: #f1c40f; background: #262110; }
+.tut-glow { outline: 3px solid #2ecc71 !important; outline-offset: 2px; box-shadow: 0 0 0 4px rgba(46,204,113,.35), 0 0 22px 6px rgba(46,204,113,.75) !important; animation: tutglow 1.1s ease-in-out infinite alternate; }
+@keyframes tutglow { from { box-shadow: 0 0 0 3px rgba(46,204,113,.3), 0 0 10px 2px rgba(46,204,113,.5); } to { box-shadow: 0 0 0 5px rgba(46,204,113,.5), 0 0 26px 8px rgba(46,204,113,.9); } }
+body.guided .dock .dkc { outline: 3px solid #2ecc71; outline-offset: 2px; box-shadow: 0 0 18px 4px rgba(46,204,113,.7); }
+body.guided .cmenu .mitem.act:not([disabled]) { outline: 2px solid #2ecc71; background: rgba(46,204,113,.18); }
+@media (max-width: 700px) { .gpanel { top: 50px; right: 6px; left: 6px; width: auto; max-height: 34vh; overflow: auto; font-size: 13px; padding: 8px 10px; } .gpanel .coachhead { font-size: 15px; } }
+.gpanel .coachhead { cursor: pointer; }
+.gpanel.min { cursor: pointer; padding: 6px 10px; }
+body.guided .card.playable:not(.tut-glow), body.guided .card.usable:not(.tut-glow) { box-shadow: none; }
 
 /* Tema «cómic nocturno»: azul marino profundo, títulos amarillos con tipografía de cómic y acentos cian. */
 :root {
@@ -1613,6 +1625,7 @@ class Game {
     for (const pi of cfg.dealExtra || []) if (this.players[pi]) await this.dealEncounter(this.players[pi]);
     if (cfg.campaign && root.MC_CAMPAIGN && root.MC_CAMPAIGN.hook) await root.MC_CAMPAIGN.hook(this, 'pre');
     if (cfg.pvp && root.MC_PVP) await root.MC_PVP.hook(this, 'pre');
+    if (cfg.onSetup) await cfg.onSetup(this);
     // cartas que la identidad pone en juego o aparta antes de robar (formas de energía, forma de masa, Brillo mortal)
     for (const p of this.players) for (const code of [...p.aes, ...p.heroes]) { const pf = this.FX.get(code, this); if (pf.preSetup) await pf.preSetup(this, this.idOf(p), p); }
     // manos iniciales (paso 12 del reglamento)
@@ -26972,6 +26985,7 @@ function renderNow() {
   } catch (e) { console.error(e); body = h('pre', { class: 'err' }, String(e.stack || e)); }
   root.replaceChildren(...[nav, body].filter(Boolean));
   syncOverlay();
+  try { guidedDecorate(); } catch (e) { console.error(e); }
   if (UI.popover) document.body.append(UI.popover.el);
 }
 // Capa fija para la pantalla de combate: no se reconstruye en cada render (así la animación no se reinicia)
@@ -27137,8 +27151,10 @@ function renderHome() {
   let panel;
   if (tab === 'tutoriales') {
     panel = [h('h2', {}, 'Tutoriales'),
-      h('div', { class: 'hp-item' }, h('h4', {}, '🎓 Partida tutorial: Spider-Man contra Rino'), h('p', {}, 'Una partida real guiada: un tutor te explica cada parte del juego la primera vez que aparece y te da pistas con «¿Qué hago ahora?».'),
-        h('button', { class: 'btn primary', onclick: () => startTutorial() }, '▶ Empezar el tutorial')),
+      h('div', { class: 'hp-item' }, h('h4', {}, '🎓 Lección guiada: Spider-Man contra Rino'), h('p', {}, 'Recomendado para empezar. Las cartas salen en un orden preparado y te digo paso a paso qué jugar y con qué pagar, marcándolo en verde. En unos 15 minutos verás todas las partes del juego.'),
+        h('button', { class: 'btn primary', onclick: () => startGuided() }, '🎓 Empezar la lección')),
+      h('div', { class: 'hp-item' }, h('h4', {}, '🧭 Partida con tutor'), h('p', {}, 'Una partida real (cartas al azar) donde un tutor explica cada parte la primera vez que aparece y te da pistas con «¿Qué hago ahora?».'),
+        h('button', { class: 'btn', onclick: () => startTutorial() }, '▶ Partida con tutor')),
       h('div', { class: 'hp-item' }, h('h4', {}, '📘 Aprende a jugar'), h('p', {}, 'El reglamento de iniciación oficial en español: turnos, fases, cartas y cómo ganar.'),
         h('a', { class: 'btn primary', href: GL.files.learn, target: '_blank', rel: 'noopener' }, 'Abrir PDF')),
       h('div', { class: 'hp-item' }, h('h4', {}, '📗 Guía de referencia'), h('p', {}, 'Todas las reglas detalladas y el glosario completo, para resolver dudas durante la partida.'),
@@ -27525,13 +27541,13 @@ function renderNewGame() {
   const roman = { I: 1, II: 2, III: 3, IV: 4 };
   const defStages = (() => { const ov = FX.stageOverride && FX.stageOverride[v.set]; if (ov) return ov(st.expert); const nums = v.stages.filter((s) => roman[s.stage]).sort((a, b) => roman[a.stage] - roman[b.stage]); if (nums.length >= 3) return (st.expert ? nums.slice(1, 3) : nums.slice(0, 2)).map((s) => s.code); return v.stages.map((s) => s.code); })();
   const stages = st.stages || defStages;
-  if (!ds.length) return h('main', { class: 'page' }, h('h2', {}, 'Nueva partida'), h('p', {}, 'Primero crea un mazo… o aprende a jugar con la partida tutorial (no necesita mazo).'), h('div', { class: 'row gap' }, h('button', { class: 'btn primary', onclick: () => startTutorial() }, '🎓 Partida tutorial contra Rino'), h('button', { class: 'btn', onclick: () => setScreen('decks') }, 'Ir a mazos')));
+  if (!ds.length) return h('main', { class: 'page' }, h('h2', {}, 'Nueva partida'), h('p', {}, 'Primero crea un mazo… o aprende a jugar con la partida tutorial (no necesita mazo).'), h('div', { class: 'row gap wrap' }, h('button', { class: 'btn primary', onclick: () => startGuided() }, '🎓 Lección guiada paso a paso'), h('button', { class: 'btn', onclick: () => startTutorial() }, 'Partida con tutor contra Rino'), h('button', { class: 'btn', onclick: () => setScreen('decks') }, 'Ir a mazos')));
   const modeTabs = h('div', { class: 'tabs3 ngmode', style: { maxWidth: '520px' } },
     [['coop', 'Cooperativo'], ['pvp', '⚔ Competitivo (Civil War)']].map(([k, l]) => h('button', { class: (UI.ngMode || 'coop') === k ? 'on' : '', onclick: () => { UI.ngMode = k; render(); } }, l)));
   if (UI.ngMode === 'pvp') return renderPvpSetup(ds, modeTabs);
   return h('main', { class: 'page newgame' },
     h('h2', {}, 'Nueva partida'), modeTabs,
-    h('div', { class: 'row gap wrap' }, h('span', { class: 'muted' }, '¿Primera vez?'), h('button', { class: 'btn small', onclick: () => startTutorial() }, '🎓 Partida tutorial contra Rino')),
+    h('div', { class: 'row gap wrap' }, h('span', { class: 'muted' }, '¿Primera vez?'), h('button', { class: 'btn small', onclick: () => startGuided() }, '🎓 Lección guiada'), h('button', { class: 'btn small', onclick: () => startTutorial() }, 'Partida con tutor')),
     h('div', { class: 'grid2' },
       h('section', { class: 'panel' }, h('h3', {}, 'Jugadores (' + st.decks.length + ')'),
         st.decks.map((id, i) => h('div', { class: 'row gap' },
@@ -27714,6 +27730,283 @@ function startTutorial() {
   T.game = g;
   tutTrigger('start');
   launch(g, false);
+}
+
+
+// ======================= TUTORIAL DIRIGIDO (lección paso a paso) =======================
+// Mazos ordenados y una lista de pasos: cada paso dice qué hacer, marca en verde la carta o el botón y
+// solo deja hacer esa acción. Las preguntas del motor se filtran para que solo se pueda elegir lo indicado.
+const GD = {
+  hpI: 8, hpII: 10,
+  // mazo del jugador en orden de robo
+  deck: [
+    // mano inicial (Peter Parker, 6 cartas)
+    '01006', '01088', '01008', '01090', '01083', '01085',
+    // robo al final de la ronda 1 (4)
+    '01007', '01005', '01089', '01062',
+    // robo al final de la ronda 2 (5)
+    '01004', '01060', '01002', '01090', '01085',
+    // Sentido arácnido durante el ataque de la ronda 2 (1)
+    '01088',
+    // Gata Negra descarta estas 2 (las dos tienen recurso mental)
+    '01089', '01005',
+    // robo al final de la ronda 3 (4)
+    '01088', '01090', '01089', '01086',
+    // relleno
+    '01064', '01065', '01061', '01003', '01063', '01084',
+  ],
+  // cartas de encuentro de cada fase del villano (en orden: potenciaciones, reparto)
+  enc: { 1: ['01101'], 2: ['01106', '01186', '01112', '01187'], 3: ['01187', '01099'], 4: ['01188', '01189', '01186'] },
+};
+const GSTEPS = [
+  { info: true, title: '¡Bienvenido a tu primera partida!', text: [
+    'En esta lección jugarás con <b>Spider-Man</b> contra <b>Rino</b>. Yo elijo qué cartas salen y te diré exactamente qué hacer, para que veas todas las partes del juego.',
+    'Las cartas y botones que debes usar aparecerán <b style="color:#2ecc71">marcados en verde</b>. Las demás acciones estarán bloqueadas mientras dure la lección.',
+    '<b>Objetivo:</b> derrotar a Rino (etapas I y II) antes de que su plan principal se complete o te derrote. (En esta lección Rino tiene menos vida que en una partida normal.)'] },
+  { title: 'Mano inicial y mulligan', text: [
+    'Has robado tu mano inicial: 6 cartas, el tamaño de mano de Peter Parker.',
+    'Antes de empezar puedes hacer <b>mulligan</b>: descartar las cartas que no quieras y robar otras. Esta mano es perfecta: pulsa <b>«Mantener la mano»</b>.'],
+    keep: true, doneLog: /fase de jugador/ },
+  { info: true, title: 'El tablero', text: [
+    '<b>Arriba</b> está Rino: su <b>vida</b> (❤), su <b>ATQ</b> (ataque) y su <b>PLAN</b>. A su lado, el <b>plan principal</b> «¡Allanamiento!»: si su amenaza llega al número que indica, pierdes.',
+    '<b>En el centro</b> está tu identidad. Ahora mismo es <b>Peter Parker</b> (Alter ego). <b>Abajo</b>, tu mano de cartas.',
+    'Peter Parker tiene la habilidad <b>Científico</b>: una vez por ronda genera un recurso [mental] para pagar cartas. ¡Vamos a usarla!'] },
+  { title: 'Paso 1 · Juega un apoyo', text: [
+    'Toca <b>Tía May</b> en tu mano y elige <b>«Jugar»</b>. Es un <b>apoyo</b>: se queda en juego y te deja curar a Peter Parker.',
+    'Cuesta 1 recurso. Cuando te pida pagar, elige <b>Peter Parker (Científico)</b>, que genera el recurso sin gastar cartas, y pulsa «Pagar».'],
+    glow: ['01006'], allow: { code: '01006', act: /^Jugar \(/ }, pay: { sources: [/Peter Parker|Científico/], cards: [] }, doneLog: /juega Tía May/ },
+  { title: 'Paso 2 · Cambia a Héroe', text: [
+    'Tu identidad tiene dos caras. En <b>Alter ego</b> te curas y el villano trama contra ti; en <b>Héroe</b> puedes atacar y desbaratar, y el villano te ataca.',
+    'Una vez por turno puedes cambiar de cara gratis. Toca a <b>Peter Parker</b> y elige <b>«Cambiar a Héroe»</b>.'],
+    glow: ['01001b'], allow: { code: /^01001/, act: /Cambiar a Héroe/ }, doneLog: /cambia a forma de Héroe/ },
+  { title: 'Paso 3 · Juega una mejora pagando con una carta', text: [
+    'Ahora juega <b>Lanzarredes</b> (una <b>mejora</b>, coste 1).',
+    'Esta vez paga <b>descartando una carta de tu mano</b>: elige <b>Emergencia</b>. Cada carta aporta los iconos de recurso de su esquina inferior; Emergencia tiene 1 de [energía].'],
+    glow: ['01008'], allow: { code: '01008', act: /^Jugar \(/ }, pay: { cards: ['01085'], sources: [] }, doneLog: /juega Lanzarredes/ },
+  { title: 'Paso 4 · Juega un aliado', text: [
+    'Juega a <b>Pájaro Burlón</b> (un <b>aliado</b>, coste 3).',
+    'Paga con la carta <b>Energía</b> (da 2 recursos de [energía]) y con <b>Lanzarredes</b>: su habilidad de Recurso lo agota y le quita un contador para generar un recurso comodín.',
+    'Cuando entre en juego, su <b>Respuesta</b> te dejará <b>aturdir</b> a Rino: acéptala. Un enemigo aturdido pierde su próximo ataque.'],
+    glow: ['01083'], allow: { code: '01083', act: /^Jugar \(/ }, pay: { cards: ['01088'], sources: [/Lanzarredes/] }, window: /Pájaro|aturd/i, doneLog: /queda aturdido/ },
+  { title: 'Paso 5 · Ataca con tu héroe', text: [
+    'Toca a <b>Spider-Man</b> y elige <b>«Atacar»</b>: inflige a Rino tanto daño como tu ATQ (2).',
+    'Usar un poder básico (atacar, desbaratar o recuperarse) <b>agota</b> tu identidad: la carta se tumba y no podrás usar otro hasta que se prepare.'],
+    glow: ['01001a'], allow: { code: /^01001/, act: /^Atacar/ }, doneLog: /Rino \(I\) sufre 2 de daño \(ataque de Spiderman\)/ },
+  { title: 'Paso 6 · Ataca con tu aliado', text: [
+    'Los aliados también pueden atacar o desbaratar agotándose. Toca a <b>Pájaro Burlón</b> y elige <b>«Atacar»</b>.',
+    'Fíjate: al atacar sufre <b>daño de consecuencia</b> (el número pequeño junto a su ATQ). Si se queda sin vida, se descarta.'],
+    glow: ['01083'], allow: { code: '01083', act: /^Atacar/ }, doneLog: /Pájaro Burlón sufre 1 de daño \(consecuencia\)/ },
+  { title: 'Paso 7 · Termina tu turno', text: [
+    'Ya has hecho todo lo útil este turno. Pulsa <b>«Fin de turno»</b>.',
+    'Al acabar la fase de jugador podrás descartar cartas (esta vez no descartes ninguna: pulsa <b>«Ninguna»</b>) y robarás hasta tu tamaño de mano. Después se <b>preparan</b> todas tus cartas.'],
+    glowEnd: true, allowEnd: true, keep: true, doneLog: /Fase del villano/ },
+  { info: true, title: 'La fase del villano', text: [
+    'Ahora juega Rino. Su fase tiene 4 pasos:',
+    '<b>1.</b> Se coloca amenaza en su plan principal. <b>2.</b> Rino se activa: como estás en forma de Héroe, te <b>atacaría</b>… ¡pero está aturdido! Así que pierde el ataque y se le quita el aturdimiento. <b>3.</b> Te reparte una carta de encuentro bocabajo. <b>4.</b> Se revela.',
+    'Pulsa «Continuar» (o Intro) en cada aviso para seguir.'] },
+  { wait: true, title: 'Mira lo que pasa', text: ['Rino resuelve su fase. La carta de encuentro será un <b>esbirro</b>: un enemigo que se queda enfrentado contigo.'], doneLog: /Mercenario de Hydra entra en juego/ },
+  { info: true, title: 'Esbirros y Guardia', text: [
+    'El <b>Mercenario de Hydra</b> está enfrentado contigo: en cada fase del villano también se activará.',
+    'Tiene <b>Guardia</b>: mientras esté en juego no puedes atacar a Rino. Hay que quitarlo de en medio primero.'] },
+  { wait: true, title: 'Nueva ronda', text: ['Empieza la ronda 2. Tus cartas se han preparado y has robado nuevas cartas.'], doneTurn: true },
+  { title: 'Paso 8 · Vincula una mejora a un esbirro', text: [
+    'Juega <b>Rastreador arácnido</b> y vincúlalo al <b>Mercenario de Hydra</b>. Cuando ese esbirro sea derrotado, quitarás hasta 3 de amenaza de un plan.',
+    'Paga con la carta <b>Fuerza</b>: genera 2 recursos [físico]. Sobra 1, que se pierde; no pasa nada.'],
+    glow: ['01007'], allow: { code: '01007', act: /^Jugar \(/ }, pay: { cards: ['01090'], sources: [] }, pick: ['01101'], doneLog: /Rastreador arácnido se vincula/ },
+  { title: 'Paso 9 · Ataca al esbirro', text: [
+    'Toca a <b>Spider-Man</b> → <b>«Atacar»</b> y elige al <b>Mercenario de Hydra</b> (tiene 3 de vida; le harás 2).'],
+    glow: ['01001a'], allow: { code: /^01001/, act: /^Atacar/ }, pick: ['01101'], doneLog: /Mercenario de Hydra sufre 2 de daño/ },
+  { title: 'Paso 10 · Remata con tu aliado', text: [
+    'Ahora <b>Pájaro Burlón</b> → <b>«Atacar»</b> al <b>Mercenario de Hydra</b> para derrotarlo.',
+    'Al morir, el Rastreador arácnido quita amenaza del plan principal <b>¡Allanamiento!</b>.'],
+    glow: ['01083'], allow: { code: '01083', act: /^Atacar/ }, pick: ['01101', '01097b'], doneLog: /Se retiran \d+ de amenaza de ¡Allanamiento!/ },
+  { title: 'Paso 11 · Un evento de ataque', text: [
+    'Los <b>eventos</b> se juegan, hacen su efecto y se descartan. Juega <b>Balanceo con patada</b> contra <b>Rino</b>: ¡8 de daño!',
+    'Cuesta 3: paga con <b>Genio</b> (2 recursos [mental]) y <b>El poder de la justicia</b> (1 comodín).'],
+    glow: ['01005'], allow: { code: '01005', act: /^Jugar \(/ }, pay: { cards: ['01089', '01062'], sources: [] }, pick: ['01094'], doneLog: /Rino \(I\) es derrotado/ },
+  { info: true, title: '¡Rino cambia de etapa!', text: [
+    'Has derrotado a <b>Rino (I)</b>. Pero el villano tiene etapas: ahora aparece <b>Rino (II)</b>, con nueva vida y más ATQ.',
+    'Al aparecer ha puesto en juego un <b>plan secundario</b>: «Arramblar con todo». Los planes secundarios tienen su propia amenaza y efectos; para quitarlos hay que desbaratarlos.'] },
+  { title: 'Paso 12 · Termina el turno', text: ['No te quedan más cartas útiles. Pulsa <b>«Fin de turno»</b> y luego <b>«Ninguna»</b> al descartar.'],
+    glowEnd: true, allowEnd: true, keep: true, doneLog: /Fase del villano/ },
+  { info: true, title: 'Rino te va a atacar', text: [
+    'Estás en forma de Héroe, así que Rino te <b>ataca</b>. Primero se activa <b>Sentido arácnido</b> (la habilidad de Spider-Man): robas 1 carta.',
+    'Rino recibe una <b>carta de potenciación</b> bocabajo: sus iconos se suman a su ATQ.',
+    'Te preguntará <b>quién defiende</b>: elige a <b>Spider-Man</b>. El daño se reduce en tu DEF (3), pero tu héroe queda agotado y no podrá usar poderes básicos el próximo turno.'] },
+  { title: '¿Quién defiende?', text: ['Pulsa «Continuar» en los avisos de la fase del villano. Cuando te pregunte quién defiende, elige <b>defender con Spider-Man</b>.'], defend: 'hero', doneLog: /Spiderman defiende/ },
+  { wait: true, title: 'Carta de potenciación', text: ['Mira la potenciación: su icono se suma al ATQ de Rino (3). Tu DEF reduce el daño.'], doneLog: /sufre \d+ de daño \(ataque de Rino|El ataque no causa daño/ },
+  { title: 'Paso 13 · Cancela una perfidia', text: [
+    'Esta vez te han repartido <b>2 cartas</b>: el plan secundario «Arramblar con todo» tiene un <b>icono de peligro</b>, que añade una carta más en el paso 3.',
+    'La primera es una <b>perfidia</b>: «Falsa alarma» te dejaría <b>confundido</b> (tu próximo desbaratar no haría nada).',
+    'Tienes <b>Sentido arácnido mejorado</b>: una <b>Interrupción</b> que anula el efecto. Cuando te lo ofrezca, úsalo y paga con <b>Energía</b>.'],
+    window: /Sentido arácnido mejorado/, pay: { cards: ['01088'], sources: [] }, doneLog: /Se anula|anulan/ },
+  { wait: true, title: 'Otra perfidia', text: ['La segunda carta, «Mover ficha», hace que Rino <b>trame</b>: pone amenaza en el plan principal igual a su PLAN, más los iconos de una nueva potenciación.'], doneTurn: true },
+  { info: true, title: 'Tu héroe está agotado', text: [
+    'Como defendiste, Spider-Man sigue <b>agotado</b>: este turno no puede atacar ni desbaratar con sus poderes básicos.',
+    '¡Pero puedes jugar cartas y usar aliados!'] },
+  { title: 'Paso 14 · Gata Negra', text: [
+    'Juega a <b>Gata Negra</b> (aliado, coste 2) pagando con <b>Fuerza</b>.',
+    'Su efecto: descarta las 2 primeras cartas de tu mazo y te quedas las que tengan recurso [mental]. ¡Mira qué sale!'],
+    glow: ['01002'], allow: { code: '01002', act: /^Jugar \(/ }, pay: { cards: ['01090'], sources: [] }, doneLog: /juega Gata Negra/ },
+  { title: 'Paso 15 · Desbarata el plan secundario', text: [
+    'Juega <b>¡Por la justicia!</b> sobre <b>Arramblar con todo</b>. Quita 3 de amenaza… ¡o 4 si lo pagas con un recurso [mental]!',
+    'Paga con <b>Genio</b>, que acaba de llegar a tu mano gracias a Gata Negra.'],
+    glow: ['01060'], allow: { code: '01060', act: /^Jugar \(/ }, pay: { cards: ['01089'], sources: [] }, pick: ['01107'], doneLog: /Arramblar con todo se descarta|Plan secundario derrotado/ },
+  { title: 'Paso 16 · Ataca con Gata Negra', text: ['Toca a <b>Gata Negra</b> → <b>«Atacar»</b> a <b>Rino</b>. Ella no sufre daño de consecuencia al atacar.'],
+    glow: ['01002'], allow: { code: '01002', act: /^Atacar/ }, pick: ['01095'], doneLog: /Rino \(II\) sufre 1 de daño \(ataque de Gata Negra\)/ },
+  { title: 'Paso 17 · Vuelve a Alter ego', text: [
+    'Spider-Man tiene algo de daño. Cambia a <b>Alter ego</b> (toca tu identidad → «Cambiar a Alter ego»).',
+    'En Alter ego, Rino no te ataca: <b>trama</b> (pone amenaza en su plan). Y el próximo turno podrás curarte.'],
+    glow: ['01001a'], allow: { code: /^01001/, act: /Cambiar a Alter ego/ }, doneLog: /cambia a forma de Alter ego/ },
+  { title: 'Paso 18 · Termina el turno', text: ['Pulsa <b>«Fin de turno»</b> y <b>«Ninguna»</b> al descartar. Como Peter Parker tiene tamaño de mano 6, robarás más cartas.'],
+    glowEnd: true, allowEnd: true, keep: true, doneLog: /Fase del villano/ },
+  { info: true, title: 'Rino trama', text: [
+    'Como estás en Alter ego, Rino <b>ejecuta su plan</b>: pondrá amenaza igual a su PLAN más la potenciación.',
+    'Tienes <b>Emergencia</b>: una Interrupción que reduce en 1 esa amenaza. Úsala cuando te la ofrezca (cuesta 0).'] },
+  { title: 'Usa Emergencia', text: ['Pulsa «Continuar» en los avisos. Cuando Rino vaya a tramar aparecerá la opción: juega <b>Emergencia</b>.'], window: /Emergencia/, pay: { cards: [], sources: [] }, doneLog: /Emergencia: -1|reduce/ },
+  { wait: true, title: 'Accesorios', text: ['La carta de encuentro de esta ronda es un <b>accesorio</b>: se vincula a Rino y le da ventajas (Embestida le da +ATQ y Exceso en su próximo ataque).'], doneTurn: true },
+  { title: 'Paso 19 · Cúrate con Tía May', text: [
+    'Estás en Alter ego. Toca a <b>Tía May</b> y usa su acción: cura hasta 4 de daño a Peter Parker (ahora tienes el daño del ataque de Rino).'],
+    glow: ['01006'], allow: { code: '01006', act: /./ }, doneLog: /se cura|cura/ },
+  { title: 'Paso 20 · Vuelve a Héroe', text: ['Ahora cambia a <b>Héroe</b> para el golpe final (toca tu identidad → «Cambiar a Héroe»).'],
+    glow: ['01001b'], allow: { code: /^01001/, act: /Cambiar a Héroe/ }, doneLog: /cambia a forma de Héroe/ },
+  { title: 'Paso 21 · Ataque básico', text: ['Toca a <b>Spider-Man</b> → <b>«Atacar»</b> a Rino.'],
+    glow: ['01001a'], allow: { code: /^01001/, act: /^Atacar/ }, pick: ['01095'], doneLog: /Rino \(II\) sufre 2 de daño \(ataque de Spiderman\)/ },
+  { title: 'Paso 22 · ¡El golpe final!', text: [
+    'Juega <b>Balanceo con patada</b> contra <b>Rino</b>. Paga con <b>Energía</b> (2) y <b>Lanzarredes</b> (1).'],
+    glow: ['01005'], allow: { code: '01005', act: /^Jugar \(/ }, pay: { cards: ['01088'], sources: [/Lanzarredes/] }, pick: ['01095'], doneLog: /VICTORIA|derrotado a Rino/ },
+  { info: true, title: '¡Victoria!', text: [
+    '¡Has derrotado a Rino! Has visto casi todo lo básico de Marvel Champions:',
+    'Alter ego y Héroe · pagar con recursos y habilidades · apoyos, mejoras, aliados y eventos · atacar y desbaratar · daño de consecuencia · esbirros con Guardia · planes secundarios · fase del villano · defender · potenciaciones · interrupciones · aturdido · accesorios · etapas del villano.',
+    'Ahora prueba una partida normal desde «Jugar», o la partida con tutor (que solo da pistas) para practicar.'], last: true },
+];
+function guidedNoEnd() { const s = guided() && gStep(); return !!guided() && !(s && s.allowEnd); }
+function guided() { return UI.guided && UI.guided.game === UI.g ? UI.guided : null; }
+function gStep() { const G = UI.guided; return G ? GSTEPS[G.i] : null; }
+function gAdvance() { const G = UI.guided; if (!G) return; G.i++; G.min = false; G.since = Date.now(); render(); gRelease(); }
+function gRelease() { const G = UI.guided; if (!G) return; const s = gStep(); if (s && s.info) return; const w = G.waiters.splice(0); w.forEach((f) => f()); }
+// las llamadas del motor esperan mientras haya una explicación abierta
+function gGate() { const G = UI.guided; if (!G) return Promise.resolve(); const s = gStep(); if (!s || !s.info) return Promise.resolve(); return new Promise((res) => G.waiters.push(res)); }
+function gCheckLog(m) {
+  const G = UI.guided; if (!G) return;
+  const s = gStep(); if (!s || s.info) return;
+  if (s.doneLog && s.doneLog.test(m)) gAdvance();
+}
+function gStack(g, codes, zone) {
+  // pone esas cartas encima del mazo en ese orden (la primera es la que sale primero)
+  const z = g.z(zone);
+  for (let i = codes.length - 1; i >= 0; i--) {
+    let iid = z.find((x) => g.C[x].code === codes[i] && !z.slice(z.length - (codes.length - 1 - i)).includes(x));
+    if (iid == null) { const c = g.mk(codes[i], zone === 'enc.deck' ? null : 0, zone); iid = c.iid; }
+    z.splice(z.indexOf(iid), 1); z.push(iid);
+  }
+}
+function startGuided() {
+  const deck = {}; for (const c of GD.deck) deck[c] = (deck[c] || 0) + 1;
+  const players = [{ heroSet: 'spider_man', deck, aspects: ['justice'], deckName: 'Lección — Spider-Man' }];
+  const cfg = { players, villainSet: 'rhino', modulars: [], expert: false, standardSets: ['standard'], expertSets: ['expert'], pause: {},
+    onSetup: async (g) => {
+      // mazo del jugador en el orden de la lección (el último del array es el de arriba)
+      const z = g.z(g.pz(g.players[0], 'deck'));
+      const want = GD.deck.slice();
+      const ordered = [];
+      for (const code of want) { const i = z.findIndex((iid) => g.C[iid].code === code && !ordered.includes(iid)); if (i >= 0) ordered.push(z[i]); }
+      const rest = z.filter((iid) => !ordered.includes(iid));
+      z.length = 0; z.push(...rest, ...ordered.reverse());
+      // obligación fuera del mazo de encuentros para que no interfiera
+      for (const c of g.cards('enc.deck').filter((x) => x.code === '01165')) g.put(c, 'removed');
+    } };
+  const io = makeIO();
+  io.save = null;
+  const G = UI.guided = { i: 0, waiters: [], since: Date.now() };
+  const wrapGate = (k) => { const f = io[k]; if (!f) return; io[k] = async (...a) => { await gGate(); return f(...a); }; };
+  ['noticeFx', 'phaseFx', 'stageFx', 'revealed', 'boostFx', 'flipFx', 'fdFlip', 'attachFx', 'manual'].forEach(wrapGate);
+  const ask0 = io.ask;
+  io.ask = async (q) => {
+    await gGate();
+    const s = gStep() || {};
+    if (/Quién defiende/.test(q.title || '') && s.defend) { const o = q.options.filter((x) => x.value === s.defend); if (o.length) return ask0({ ...q, options: o }); }
+    if (q.window) {
+      if (s.window) { const o = q.options.filter((x) => x.value !== null && s.window.test(x.label || '')); if (o.length) return ask0({ ...q, options: o }); }
+      return null; // ventanas que la lección no usa: se saltan
+    }
+    if (s.pick) { const o = q.options.filter((x) => x.iid != null && UI.g.C[x.iid] && s.pick.includes(UI.g.C[x.iid].code)); if (o.length) return ask0({ ...q, options: o }); }
+    return ask0(q);
+  };
+  const askCards0 = io.askCards;
+  io.askCards = async (q) => {
+    await gGate();
+    const s = gStep() || {};
+    if (/mulligan|descarta las cartas que quieras|antes de robar/i.test(q.title || '')) return askCards0({ ...q, iids: [], min: 0 });
+    if (s.pick) { const ids = q.iids.filter((i) => UI.g.C[i] && s.pick.includes(UI.g.C[i].code)); if (ids.length) return askCards0({ ...q, iids: ids }); }
+    return askCards0(q);
+  };
+  const pay0 = io.pay;
+  io.pay = async (q) => {
+    await gGate();
+    const s = gStep() || {};
+    if (s.pay) {
+      const g = UI.g;
+      const cards = q.cards.filter((c) => s.pay.cards.includes(g.C[c.iid].code)).filter((c, i, a) => a.findIndex((x) => g.C[x.iid].code === g.C[c.iid].code) === i);
+      const sources = q.sources.filter((x) => s.pay.sources.some((re) => re.test(x.label || '') || re.test(g.d(g.C[x.iid]).name)));
+      return pay0({ ...q, cards, sources: sources.length || cards.length ? sources : q.sources });
+    }
+    return pay0(q);
+  };
+  const turn0 = io.playerTurn;
+  io.playerTurn = async (p, g) => { await gGate(); const s = gStep(); if (s && s.doneTurn) gAdvance(); return turn0(p, g); };
+  const log0 = io.log;
+  io.log = (m, k) => { const r = log0(m, k); try { gCheckLog(String(m || '')); } catch (e) { console.error(e); } return r; };
+  const g = new MC.Game(cfg, io);
+  g.villainHp = (code) => (code === '01094' ? GD.hpI : GD.hpII);
+  // cartas de encuentro de cada ronda
+  const vp0 = g.villainPhase.bind(g);
+  g.villainPhase = async () => { const list = GD.enc[g.round] || []; gStack(g, list, 'enc.deck'); return vp0(); };
+  G.game = g;
+  UI.tutorial = null;
+  launch(g, false);
+}
+// filtro de acciones del menú de carta durante la lección
+function guidedAllows(g, ci, label) {
+  const G = guided(); if (!G) return true;
+  const s = gStep(); if (!s || !s.allow) return false;
+  const codeOk = s.allow.code instanceof RegExp ? s.allow.code.test(ci.code) : ci.code === s.allow.code;
+  return codeOk && s.allow.act.test(label);
+}
+function renderGuided(g) {
+  const G = guided(); if (!G) return null;
+  const s = gStep(); if (!s) return null;
+  const html = (x) => { const el = h('p', {}); el.innerHTML = x; return el; };
+  const n = GSTEPS.filter((x) => !x.info && !x.wait).length; const k = GSTEPS.slice(0, G.i + 1).filter((x) => !x.info && !x.wait).length;
+  if (s.info) return h('div', { class: 'coachwrap' }, h('div', { class: 'coach' }, h('div', { class: 'coachhead' }, '🎓 ' + s.title), s.text.map(html),
+    h('div', { class: 'row gap' }, s.last ? h('button', { class: 'btn primary', onclick: () => { UI.guided = null; UI.g = null; setScreen('home'); } }, 'Terminar la lección') :
+      h('button', { class: 'btn primary', onclick: () => gAdvance() }, 'Entendido'))));
+  const pk = UI.prompt && UI.prompt.kind;
+  if (!s.wait && pk && !['cards', 'pay', 'ask'].includes(pk)) return null;
+  if (G.min) return h('div', { class: 'gpanel min' + (s.wait ? ' wait' : ''), onclick: () => { G.min = false; render(); } }, h('div', { class: 'coachhead' }, (s.wait ? '⏳ ' : '👉 ') + s.title, h('span', { class: 'muted', style: { fontSize: '12px', marginLeft: '8px' } }, '▾ ver')));
+  return h('div', { class: 'gpanel' + (s.wait ? ' wait' : '') }, h('div', { class: 'coachhead', title: 'Minimizar', onclick: () => { G.min = true; render(); } }, (s.wait ? '⏳ ' : '👉 ') + s.title, h('span', { class: 'muted', style: { fontSize: '12px', marginLeft: '8px' } }, 'paso ' + Math.min(k, n) + ' de ' + n + ' · ▴')), s.text.map(html),
+    h('div', { class: 'row gap' }, h('button', { class: 'btn small', onclick: async () => { if (await uiConfirm('¿Salir de la lección?')) { UI.guided = null; UI.g = null; setScreen('home'); } } }, 'Salir de la lección')));
+}
+function guidedDecorate() {
+  const G = guided();
+  document.body.classList.toggle('guided', !!G);
+  if (!G) return;
+  const s = gStep() || {};
+  const g = UI.g;
+  for (const el of document.querySelectorAll('[data-iid]')) {
+    const ci = g.C[el.getAttribute('data-iid')];
+    const base = (c) => String(c).replace(/[ab]$/, '');
+    el.classList.toggle('tut-glow', !!(ci && s.glow && !el.closest('.dock') && s.glow.some((c) => base(c) === base(ci.code)) && !UI.prompt));
+  }
+  if (G.scrolled !== G.i && !UI.prompt) {
+    const el = [...document.querySelectorAll('.tut-glow[data-iid]')].find((e) => e.offsetParent);
+    if (el) { G.scrolled = G.i; const r = el.getBoundingClientRect(); if (r.top < 60 || r.bottom > window.innerHeight - 40) setTimeout(() => el.scrollIntoView({ block: 'center', behavior: 'smooth' }), 50); }
+  }
+  for (const b of document.querySelectorAll('button')) {
+    const t = b.textContent || '';
+    const on = (s.glowEnd && /Fin de turno/.test(t)) || (s.keep && /Mantener la mano|^Ninguna$/.test(t)) || (UI.prompt && UI.prompt.kind === 'pay' && /^Pagar$/.test(t));
+    b.classList.toggle('tut-glow', !!on);
+  }
 }
 
 // ======================= MODO COMPETITIVO (Civil War) =======================
@@ -27958,6 +28251,7 @@ function renderBoard() {
       h('div', { class: 'dockspace' })),
     h('aside', { class: 'bside' }, renderEffects(), renderReminders(g), renderLog(g)),
     renderCoach(g),
+    renderGuided(g),
     renderDock(g), hb);
 }
 function renderStatusBar(g, canAct, turnP) {
@@ -27974,7 +28268,7 @@ function renderStatusBar(g, canAct, turnP) {
     h('div', { class: 'sb-r' },
       !g.over && !UI.turn && NET.role !== 'guest' ? h('button', { class: 'btn small' + (g.pauseRequested ? ' on' : ''), title: 'Detiene el motor en la siguiente ventana para que uses herramientas manuales o juegues cartas a mano', onclick: () => { g.pauseRequested = !g.pauseRequested; render(); } }, g.pauseRequested ? '⏸ Pausa pedida' : '⏸ Pausar') : null,
       UI.turn && !UI.turn.remote ? undoBtn(g, canAct, 'btn') : null,
-      UI.turn && !UI.turn.remote ? h('button', { class: 'btn primary', disabled: !canAct, onclick: async () => { if (canAct && await uiConfirm('¿Terminar el turno de ' + UI.turn.p.name + '?')) UI.turn.resolve(); } }, 'Fin de turno') : null,
+      UI.turn && !UI.turn.remote ? h('button', { class: 'btn primary', disabled: !canAct || guidedNoEnd(), onclick: async () => { if (canAct && !guidedNoEnd() && (guided() || await uiConfirm('¿Terminar el turno de ' + UI.turn.p.name + '?'))) UI.turn.resolve(); } }, 'Fin de turno') : null,
       UI.match || UI.pvpRemote ? pvpStatusPills(g) : g.over ? h('span', { class: 'pill ' + (g.over.win ? 'green' : 'red') }, g.over.win ? '¡VICTORIA!' : 'DERROTA') : null,
       g.over && g.cfg.campaign ? h('button', { class: 'btn primary', onclick: () => { UI.g = null; setScreen('campaign'); } }, 'Volver a la campaña') : null,
       NET.role === 'guest' ? h('button', { class: 'btn small', onclick: async () => { if (await uiConfirm('¿Salir de la sala online?')) { netDisconnect(); UI.g = null; UI.stack = []; UI.turn = null; setScreen('online'); } } }, 'Salir') :
@@ -28070,11 +28364,13 @@ function doUndo() {
   const g = UI.g;
   if (!g) return;
   if (NET.role === 'guest') { netSend({ t: 'undo' }); return; }
+  if (guided()) return;
   if (UI.stack.length || !g.canUndo()) return;
   closePopover();
   if (g.undo()) { UI.nodes.clear(); toast('Jugada deshecha.', 'good', 1800); if (NET.role === 'host') netSyncNow(); render(); }
 }
 function undoBtn(g, canAct, cls) {
+  if (guided()) return null;
   const n = NET.role === 'guest' ? NET.undoN || 0 : (g.undoStack ? g.undoStack.length : 0);
   return h('button', { class: cls, disabled: !canAct || !n, title: n ? 'Deshace la última jugada de este turno (' + n + ' disponible' + (n === 1 ? '' : 's') + '). Atajo: Ctrl+Z' : 'No hay jugadas que deshacer en este turno', onclick: doUndo }, '↶ Deshacer' + (n ? ' (' + n + ')' : ''));
 }
@@ -28108,7 +28404,7 @@ function renderHandBar(g, canAct) {
         '✋ ', h('b', {}, n + ' / ' + g.handSize(p)), UI.handCollapsed ? ' ⌃' : ' ⌄'),
       active && !UI.turn.remote && !UI.stack.length && !g.busy ? h('span', { class: 'hb-hint' }, 'Tu turno: toca una carta') : null,
       active && !UI.turn.remote ? undoBtn(g, canAct, 'hb-undo') : null,
-      active && !UI.turn.remote ? h('button', { class: 'hb-end', disabled: !canAct, onclick: async () => { if (canAct && await uiConfirm('¿Terminar el turno de ' + p.name + '?')) UI.turn.resolve(); } }, 'Fin de turno') : null),
+      active && !UI.turn.remote ? h('button', { class: 'hb-end', disabled: !canAct || guidedNoEnd(), onclick: async () => { if (canAct && !guidedNoEnd() && (guided() || await uiConfirm('¿Terminar el turno de ' + p.name + '?'))) UI.turn.resolve(); } }, 'Fin de turno') : null),
     UI.handCollapsed ? null : fan);
 }
 // ¿la carta en juego tiene ahora una acción o capacidad usable por el jugador del turno?
@@ -28376,7 +28672,7 @@ function cardActions(g, ci, p, canAct) {
   const f = FX.get(ci.code);
   const owner = g.ownerP(ci);
   const list = [];
-  const add = (label, fn, dis, why) => list.push({ label, fn, dis: !!dis, why: why || '' });
+  const add = (label, fn, dis, why) => { if (guided() && !guidedAllows(g, ci, label)) return; list.push({ label, fn, dis: !!dis, why: why || '' }); };
   if (!ci.faceDown && canAct && p) {
     if (ci.zone === g.pz(p, 'hand') || ci.zone === g.pz(p, 'quiver')) {
       const pl = g.playableNow(p, ci);
@@ -28418,10 +28714,10 @@ function openCardMenu(e, ci) {
   const acts = cardActions(g, ci, p, canAct).filter((a) => !(guest && /^Jugar con resolución manual/.test(a.label)))
     .map((a) => h('button', { class: 'mitem act', disabled: a.dis, title: a.why, onclick: () => { closePopover(); if (guest) netSend({ t: 'act', iid: ci.iid, label: a.label }); else g.act(a.fn); } }, a.label, a.dis && a.why ? h('small', {}, a.why) : null));
   const handOwner = g.players.find((q) => ci.zone === g.pz(q, 'hand'));
-  if (!guest && handOwner && !canAct && (UI.manual || (!UI.stack.length && !g.busy)) && d.type !== 'resource') {
+  if (!guest && !guided() && handOwner && !canAct && (UI.manual || (!UI.stack.length && !g.busy)) && d.type !== 'resource') {
     acts.push(h('button', { class: 'mitem act', onclick: () => { closePopover(); manualDo(() => g.playManual(handOwner, ci)); } }, 'Jugar con resolución manual (' + handOwner.name + ')', h('small', {}, 'Paga el coste; el efecto lo aplicas tú')));
   }
-  const tools = guest ? null : manualTools(ci);
+  const tools = guest || guided() ? null : manualTools(ci);
   const body = h('div', { class: 'cmenu' },
     (() => {
       const art = h('div', { class: 'cm-art' }, ci.faceDown ? h('div', { class: 'cardback big' + (ci.owner == null && !ci.drone ? ' enc' : '') }, ci.drone ? 'DRON' : '') : cardThumb(ci.code, 'zoom'));
@@ -28768,7 +29064,7 @@ function renderDock(g) {
     parts.push(h('div', { class: 'dock idle' }, h('span', {}, NET.hostWait ? '⏳ ' + NET.hostWait : (NET.turnIdx != null ? 'Turno de ' + UI.g.P(NET.turnIdx).name + '.' : 'Fase del villano: el anfitrión está resolviendo.'))));
   } else if (UI.turn && !UI.g.busy && !(UI.g && handBarPlayer(UI.g) === UI.turn.p)) {
     parts.push(h('div', { class: 'dock idle' }, h('span', {}, '▶ Turno de ', h('b', {}, UI.turn.p.name), ': pulsa una carta para ver sus acciones. Cuando termines, pulsa "Fin de turno".'),
-      h('button', { class: 'btn primary', onclick: async () => { if (await uiConfirm('¿Terminar el turno de ' + UI.turn.p.name + '?')) UI.turn.resolve(); } }, 'Fin de turno')));
+      h('button', { class: 'btn primary', disabled: guidedNoEnd(), onclick: async () => { if (!guidedNoEnd() && (guided() || await uiConfirm('¿Terminar el turno de ' + UI.turn.p.name + '?'))) UI.turn.resolve(); } }, 'Fin de turno')));
   }
   return h('div', { class: 'dockwrap' }, parts);
 }
