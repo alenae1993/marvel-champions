@@ -1599,7 +1599,7 @@ class Game {
     // manos iniciales (paso 12 del reglamento)
     for (const p of this.players) await this.drawUpTo(p);
     // mulligan
-    for (const p of this.players) {
+    for (let mr = 0; mr <= (this.extraMulligan || 0); mr++) for (const p of this.players) {
       const hand = this.cards(this.pz(p, 'hand'));
       if (!hand.length) continue;
       const disc = await this.askCards(p.name + ': mulligan — elige cartas para descartar y robar de nuevo', hand, { min: 0, max: hand.length, player: p.idx, always: true });
@@ -1694,6 +1694,8 @@ class Game {
     const inPlay = (code) => this.allInPlay().some((c) => c.code === code);
     const mf = o.mts || {};
     const odin = this.players.flatMap((p) => this.cards(this.pz(p, 'play'))).find((c) => c.code === '21139a' || c.code === '21139b');
+    const illus = this.players.reduce((n, p) => n + ['deck', 'hand', 'discard'].reduce((k, z) => k + this.cards(this.pz(p, z)).filter((c) => this.hasTrait(c, 'Illusion')).length, 0), 0);
+    o.sm = { illusions: illus, villains: this.villains().map((v) => v.code), sideCount: this.sideSchemes().length, accel: this.accelTokens };
     o.mts = { ...mf, landingPad: inPlay('21180a'), blackSwan: inPlay('21182b'), towerDamaged: this.cards('env').some((c) => c.code === '21100b'),
       stones1B: !!m && m.code === '21115b', odin: odin ? odin.code : null };
     return o;
@@ -2225,6 +2227,7 @@ class Game {
     this.flash(scheme, 'heal');
     this.log('Se retiran ' + amt + ' de amenaza de ' + this.name(scheme) + '.');
     this.update();
+    if (amt > 0) await this.trigger('threatRemoved', { scheme, n: amt, thwarter: this.curThwarter || null });
     if (scheme.zone === 'side' && scheme.thr <= 0 && this.fx(scheme).onCleared) await this.fx(scheme).onCleared(this, scheme);
     else if (scheme.zone === 'side' && scheme.thr <= 0) await this.defeatScheme(scheme);
     else if (scheme.zone === 'main' && scheme.thr <= 0 && amt > 0 && this.fx(scheme).onCleared) await this.fx(scheme).onCleared(this, scheme);
@@ -2392,7 +2395,9 @@ class Game {
     if (heroForm && !id.ex && !mustAlly && !ctx.noDefend && !this.cantDefend(p)) opts.push({ label: 'Defender con ' + this.name(id) + ' (DEF ' + this.stat(id, 'def') + ')', value: 'hero', iid: id.iid });
     for (const a of this.allies(p)) if (!a.ex && !ctx.noDefend) opts.push({ label: 'Defender con ' + this.name(a) + ' (' + this.hpLeft(a) + ' vida)', value: a.iid, iid: a.iid });
     if (!mustAlly) opts.push({ label: 'No defender (ataque sin defensa)', value: 'none' });
-    const ch = ctx.forceHeroDefend ? 'hero' : await this.ask(p.name + ': ' + this.name(enemy) + ' ataca (ATQ ' + this.stat(enemy, 'atk') + (ctx.boostCards.length ? ' + ' + ctx.boostCards.length + ' carta(s) de potenciación' : '') + '). ¿Quién defiende?', opts, { always: true, player: p.idx });
+    const forced = ctx.forceDefender && this.inPlay(ctx.forceDefender) ? ctx.forceDefender : null;
+    if (forced) { opts.length = 0; opts.push({ label: this.name(forced) + ' recibe el ataque', value: forced.iid, iid: forced.iid }); }
+    const ch = forced ? forced.iid : ctx.forceHeroDefend ? 'hero' : await this.ask(p.name + ': ' + this.name(enemy) + ' ataca (ATQ ' + this.stat(enemy, 'atk') + (ctx.boostCards.length ? ' + ' + ctx.boostCards.length + ' carta(s) de potenciación' : '') + '). ¿Quién defiende?', opts, { always: true, player: p.idx });
     if (ctx.forceHeroDefend) {
       ctx.defender = id; ctx.heroDefended = true;
       this.log(this.name(id) + ' defiende sin agotarse.');
@@ -2406,7 +2411,7 @@ class Game {
       await this.trigger('basicPowerInit', bp);
       ctx.defBonus = (ctx.defBonus || 0) + bp.bonus;
     } else if (ch && ch !== 'none') {
-      const a = this.C[ch]; a.ex = true; ctx.defender = a;
+      const a = this.C[ch]; if (!forced) a.ex = true; ctx.defender = a;
       this.log(this.name(a) + ' defiende.');
     } else { ctx.undefended = true; }
     this.update();
@@ -3115,6 +3120,7 @@ class Game {
     const ctx = { attacker, target, amount, player: p, basic: !!o.basic, overkill: !!o.overkill || !!(attacker && this.d(attacker).type === 'ally' && this.kw(attacker, 'overkill')), piercing: !!o.piercing || !!(o.basic && attacker && this.kw(attacker, 'piercing')),
       ranged: !!o.ranged || (attacker && !!this.kw(attacker, 'ranged')), defeated: false, card: o.card || null };
     await this.trigger('heroAttackInit', ctx);
+    if (ctx.cancel) { this.update(); return null; }
     const vBefore = this.vIdx;
     const tCodeBefore = target.code;
     this.heroAttackDepth = (this.heroAttackDepth || 0) + 1;
@@ -3248,8 +3254,11 @@ class Game {
     await this.trigger('basicPowerInit', bp);
     const amt = this.thwartValue(id, s) + bp.bonus;
     let res = null;
-    if (this.fx(id).splitBasic && this.thwartableSchemes(p).length > 1) await this.splitThwart(p, id, s, amt);
-    else res = await this.thwartScheme(id, s, amt, { basic: true, player: p });
+    const s2 = bp.scheme && this.inPlay(bp.scheme) ? bp.scheme : s;
+    const amt2 = s2 === s ? amt : this.thwartValue(id, s2) + bp.bonus;
+    if (this.fx(id).splitBasic && this.thwartableSchemes(p).length > 1) await this.splitThwart(p, id, s2, amt2);
+    else res = await this.thwartScheme(id, s2, amt2, { basic: true, player: p });
+    if (bp.cleanup) bp.cleanup();
     for (const fn of bp.after || []) await fn(res);
     await this.trigger('afterBasicPower', { player: p, kind: 'thwart' });
   }
@@ -10030,6 +10039,115 @@ R('27173', { whenRevealed: async (g, ci, p) => {
   await g.reveal(ns, p);
   if (g.inPlay(ns) && ns.thr) await g.placeThreat(ci, ns.thr);
 } });
+
+// ===================== CAMPAÑA: MOTIVOS SINIESTROS =====================
+root.MC_SM = { surgingSands };
+const outcry = (g) => g.cards('env').find((c) => c.code === '27174a' || c.code === '27174b') || null;
+R(['27174a', '27174b'], { kw: { uses: undefined }, on: { afterDefeated: [{ cond: (g, ci, ctx) => (ctx.type === 'minion' || ctx.type === 'side_scheme') && g.inPlay(ci), run: async (g, ci) => {
+  ci.ctr = Math.max(0, (ci.ctr || 0) - 1); g.log('Clamor popular: −1 contador de notoriedad (' + ci.ctr + ').', 'good'); g.update();
+  if (ci.ctr <= 0) { await g.leavePlay(ci, 'victory'); g.log('¡El clamor popular se calma! Clamor popular pasa a la zona de victoria.', 'good'); }
+} }] } });
+R('27175', { whenRevealed: async (g, ci, p, ctx) => {
+  if (g.cfg.expert && ctx) ctx.surge = true;
+  const po = outcry(g);
+  if (po) { po.ctr = (po.ctr || 0) + 2; g.log('Campaña de difamación: +2 contadores de notoriedad en Clamor popular (' + po.ctr + ').', 'bad'); await g.removeFromGame(ci); }
+  else await g.placeThreat(g.main(), 2);
+} });
+R('27176', { on: { afterThwart: [{ cond: (g, ci, ctx) => ctx.scheme === ci && ctx.player && ctx.player.alive, run: async (g, ci, ctx) => {
+  const p = ctx.player;
+  await L.chooseOne(g, p, 'Atraco en un callejón', [
+    { label: 'Gastar un recurso [físico]', ok: g.canAfford(p, { n: 1, types: { physical: 1 } }), run: async () => { if (!(await g.pay(p, { n: 1, types: { physical: 1 } }, null, 'Paga 1 [físico]'))) await g.randomDiscard(p, 1); } },
+    { label: 'Descartar 1 carta al azar de tu mano', run: async () => g.randomDiscard(p, 1) },
+  ]);
+} }] } });
+R('27177', { on: { thwartInit: [{ cond: (g, ci, ctx) => ctx.scheme === ci && ctx.player && ctx.amount > 0, run: async (g, ci, ctx) => { g.log('Gato subido a un árbol: coste adicional, 2 de daño indirecto.'); await L.indirect(g, ctx.player, 2); } }] } });
+R('27178', { on: { threatRemoved: [{ cond: (g, ci, ctx) => ctx.scheme === ci && ctx.n > 0 && !!g.main(), run: async (g, ci, ctx) => { g.log('Secuaces atracadores: la amenaza retirada pasa al plan principal.'); await g.placeThreat(g.main(), ctx.n); } }] } });
+R('27179', { on: { villainPhaseStart: [{ cond: (g, ci) => g.inPlay(ci), run: async (g, ci) => {
+  ci.ctr = (ci.ctr || 0) + 1; g.log('Descarrilamiento: ' + ci.ctr + ' contador(es) de velocidad.'); g.update();
+  if (ci.ctr >= 2) { await g.removeFromGame(ci); for (const q of g.order()) await g.discardTop(q, 3); }
+} }] } });
+R('27180', { mayUseAtk: true });
+const venomAlly = (g) => g.allInPlay().find((c) => c.code === '27190') || null;
+R('27181', { attachHost: async (g) => venomAlly(g) || 'surge',
+  on: { enemyAttackInit: [{ cond: (g, ci, ctx) => ctx.enemy && g.d(ctx.enemy).type === 'villain' && g.inPlay(g.C[ci.host] || {}), run: async (g, ci, ctx) => {
+    const v = g.C[ci.host]; ctx.forceDefender = v; g.log('No hay traición sin castigo: ' + g.name(ctx.enemy) + ' ataca a Veneno.', 'bad');
+    (ctx.after = ctx.after || []).push(async () => { if (!g.inPlay(v)) { g.resetCard(v); g.put(v, 'victory'); g.resetCard(ci); g.put(ci, 'victory'); g.log('Veneno es derrotado: Veneno y No hay traición sin castigo pasan a la zona de victoria.', 'bad'); g.update(); } });
+  } }] },
+  abilities: [{ kind: 'action', label: 'Agotar a Veneno y gastar 2 recursos del mismo tipo → descartar esta carta', cond: (g, ci, p) => { const v = g.C[ci.host]; return !!v && !v.ex && ['mental', 'energy', 'physical'].some((t) => g.canAfford(p, { n: 2, types: { [t]: 2 } })); },
+    run: async (g, ci, p) => {
+      const ts = ['mental', 'energy', 'physical'].filter((t) => g.canAfford(p, { n: 2, types: { [t]: 2 } }));
+      const t = ts.length === 1 ? ts[0] : await g.ask('¿Qué tipo de recurso gastas?', ts.map((x) => ({ label: MC.RES_ES[x], value: x })), { always: true, player: p.idx });
+      if (!(await g.pay(p, { n: 2, types: { [t]: 2 } }, null, 'Paga 2 recursos iguales'))) return;
+      const v = g.C[ci.host]; if (v) v.ex = true; await g.discard(ci);
+    } }] });
+// Tecnología S.H.I.E.L.D.
+const myHero = (g, src, tgt) => { const p = g.ownerP(src); return p && tgt === id(g, p) && isHero(g, p) ? p : null; };
+const techStat = (map) => (g, src, tgt, s) => (g.inPlay(src) && map[s] && myHero(g, src, tgt) ? map[s] : 0);
+const techId = (map) => (g, src, tgt, s) => { const p = g.ownerP(src); return g.inPlay(src) && p && tgt === id(g, p) ? (map[s] || 0) : 0; };
+const dartsAbility = { kind: 'action', label: 'Gastar 1 recurso → 3 contadores de dardo', aeOnly: true, limit: 'round', cost: { res: 1 }, run: async (g, ci) => { ci.ctr = (ci.ctr || 0) + 3; g.log('Dardos compactos: ' + ci.ctr + ' contadores de dardo.'); } };
+const dartsResp = (two) => ({ afterHeroAttack: [{ optional: true, heroOnly: true, label: two ? '−1 dardo → 1 de daño a hasta 2 enemigos' : '−1 dardo → 1 de daño a un enemigo', cond: (g, ci, ctx, p) => ctx.attacker === id(g, p) && (ci.ctr || 0) > 0, run: async (g, ci, ctx, p) => {
+  ci.ctr--;
+  const es = two ? await g.askCards('Elige hasta 2 enemigos distintos', g.enemies().filter((e) => g.canBeDamaged(e)), { min: 1, max: 2, player: p.idx }) : [await g.chooseEnemy(p, 'Dardos compactos: 1 de daño', { ignoreGuard: true })];
+  for (const e of es.filter(Boolean)) await g.damage(e, 1, { byPlayer: p, source: 'Dardos compactos' });
+} }] });
+R('27182a', { on: dartsResp(false), abilities: [dartsAbility] });
+R('27182b', { on: dartsResp(true), abilities: [dartsAbility] });
+R('27183a', { stat: techId({ hp: 2 }), on: {
+  villainPhaseStart: [{ optional: true, heroOnly: true, label: 'gastar 1 recurso → −1 al daño de cada ataque esta fase', cost: { res: 1 }, run: async (g, ci, ctx, p) => { id(g, p).x.dampR = g.round; g.log('Tejido antichoque activo esta fase.'); } }],
+  wouldTakeDamage: [{ cond: (g, ci, ctx, p) => ctx.target === id(g, p) && ctx.attack && ctx.n > 0 && id(g, p).x.dampR === g.round && g.phase === 'villain', run: async (g, ci, ctx) => { ctx.n -= 1; g.log('Tejido antichoque: −1 al daño.'); } }],
+} });
+R('27183b', { stat: techId({ hp: 3 }), on: { wouldTakeDamage: [{ optional: true, heroOnly: true, label: 'descartar la carta superior de tu mazo → evitar 1 de daño', cond: (g, ci, ctx, p) => ctx.target === id(g, p) && ctx.attack && ctx.n > 0, run: async (g, ci, ctx, p) => { await g.discardTop(p, 1); ctx.n -= 1; } }] } });
+const goggles = (atk, pierce) => ({ stat: techStat({ thw: -1, atk }), on: { basicPowerInit: [{ cond: (g, ci, ctx, p) => ctx.player === p && ctx.kind === 'attack' && ctx.char === id(g, p), run: async (g, ci, ctx) => { ctx.overkill = true; if (pierce) ctx.piercing = true; } }] } });
+R('27184a', goggles(1, false));
+R('27184b', goggles(2, true));
+const gauntlet = (bonus) => ({ abilities: [{ kind: 'action', label: 'Agotar y sufrir 2 de daño indirecto → preparar a tu héroe', heroOnly: true, cost: { exhaust: true }, run: async (g, ci, p) => {
+  await L.indirect(g, p, 2); const me = id(g, p); if (!g.inPlay(me)) return; me.ex = false; g.log(g.name(me) + ' se prepara.');
+  if (bonus) { for (const s of ['thw', 'atk', 'def']) g.addMod(me, s, 1, 'phase'); g.log('+1 DES, ATQ y DEF hasta el final de la fase.'); }
+} }] });
+R('27185a', gauntlet(false));
+R('27185b', gauntlet(true));
+const retinal = (thw, patrol) => ({ stat: techStat({ thw }), on: { basicPowerInit: [{ cond: (g, ci, ctx, p) => ctx.player === p && ctx.kind === 'thwart' && ctx.char === id(g, p), run: async (g, ci, ctx) => {
+  const prevC = g.ignoreCrisisNow, prevP = g.ignorePatrolNow; g.ignoreCrisisNow = true; if (patrol) g.ignorePatrolNow = true;
+  ctx.cleanup = () => { g.ignoreCrisisNow = prevC; g.ignorePatrolNow = prevP; };
+  const ss = g.schemes().filter((s) => g.canRemoveThreat(s) && (patrol || s.zone !== 'main' || !g.blockedFromMain(ctx.player)));
+  if (!ss.length) return;
+  const mx = Math.max(...ss.map((s) => s.thr));
+  if (ctx.scheme && ctx.scheme.thr === mx) return;
+  const best = ss.filter((s) => s.thr === mx);
+  ctx.scheme = best.length === 1 ? best[0] : await g.pickOne('Proyector de retina: el plan con más amenaza', best, { player: ctx.player.idx });
+  g.log('Proyector de retina: la intervención básica va al plan con más amenaza (' + g.name(ctx.scheme) + ').');
+} }] } });
+R('27186a', retinal(1, false));
+R('27186b', retinal(2, true));
+const knuckles = (maxIcons, atk) => ({ stat: techStat({ atk }), on: { afterHeroAttack: [{ optional: true, heroOnly: true, label: 'descartar la carta superior de encuentros → aturdir', cond: (g, ci, ctx, p) => ctx.basic && ctx.attacker === id(g, p) && ctx.target && g.inPlay(ctx.target), run: async (g, ci, ctx) => {
+  const c = await g.drawEncounterCard(); if (!c) return; g.put(c, 'enc.discard'); const n = g.d(c).boost || 0;
+  g.log('Nudilleras eléctricas: ' + g.d(c).name + ' (' + n + ' iconos de potenciación).');
+  if (n <= maxIcons) await g.stun(ctx.target);
+} }] } });
+R('27187a', knuckles(0, 0));
+R('27187b', knuckles(1, 1));
+const bracers = (def, kw) => ({ stat: techStat({ atk: -1, def }), grantKw: (g, src, tgt) => (g.inPlay(src) && myHero(g, src, tgt) ? kw : null) });
+R('27188a', bracers(1, { retaliate: 1, steady: true }));
+R('27188b', bracers(2, { retaliate: 1, stalwart: true }));
+const navigator = (enh) => ({ on: {
+  minionEntered: [{ cond: (g, ci, ctx) => !!ctx.card, run: async (g, ci, ctx) => { ci.x.tgt = ctx.card.iid; g.log('Rastreador de muñeca se vincula a ' + g.name(ctx.card) + '.'); } }],
+  afterRevealResolved: [{ cond: (g, ci, ctx) => ctx.card && g.d(ctx.card).type === 'side_scheme' && g.inPlay(ctx.card), run: async (g, ci, ctx) => { ci.x.tgt = ctx.card.iid; g.log('Rastreador de muñeca se vincula a ' + g.name(ctx.card) + '.'); } }],
+  afterDefeated: [{ cond: (g, ci, ctx) => ctx.card && ctx.card.iid === ci.x.tgt, run: async (g, ci, ctx, p) => {
+    ci.x.tgt = null;
+    if (!enh) { await g.draw(p, 1); return; }
+    await g.draw(p, 2);
+    const h = g.cards(g.pz(p, 'hand')); const c = h.length ? await g.pickOne('Rastreador de muñeca: descarta 1 carta', h, { player: p.idx }) : null;
+    if (c) { g.put(c, g.pz(p, 'discard')); g.log(p.name + ' descarta ' + g.d(c).name + '.'); }
+  } }],
+} });
+R('27189a', navigator(false));
+R('27189b', navigator(true));
+R('27116b', {});
+
+R('27166', { attachHost: attachToId, on: { heroAttackInit: [{ cond: (g, ci, ctx) => !ctx.cancel && ctx.attacker && ctx.attacker.iid === ci.host && g.isIdentity(ctx.attacker), run: async (g, ci, ctx) => {
+  ctx.cancel = true; const me = ctx.attacker; g.log('Envuelto en telaraña: en lugar de atacar, se descarta y ' + g.name(me) + ' queda aturdido.', 'bad');
+  await g.discard(ci); await g.stun(me);
+} }] }, boost: async (g, ci, ctx) => { const p = ctx.player; if (!p) return; const me = id(g, p); if (me.stun > 0) await g.damage(me, 2, { source: g.d(ci).name }); else await g.stun(me); } });
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
@@ -10287,7 +10405,7 @@ R('27100a', { setup: async (g) => {
   for (const c of codes.slice(n)) g.mk(c, null, 'aside');
   const l = (await g.searchEncounter((d) => d.code === '27102a')) || g.mk('27102a', null, 'aside');
   for (const x of [...g.cards('enc.deck'), ...g.cards('enc.discard')].filter((x) => x.code === '27102b')) g.put(x, 'removed');
-  g.put(l, 'side'); l.thr = g.scaled(g.d(l).baseThreat || 0, g.d(l).baseThreatFixed) + g.nPlayers();
+  g.put(l, 'side'); l.thr = g.scaled(g.d(l).baseThreat || 0, g.d(l).baseThreatFixed);
   g.multiMode = 'sinister';
   g.log('Los Seis Siniestros: en juego ' + g.villains().map((v) => g.name(v)).join(', ') + '. ' + g.name(first) + ' tiene el contador de activo.', 'phase');
 } });
@@ -10295,7 +10413,7 @@ const ambushMain = { on: { noVillainActivation: [{ run: async (g) => { g.log('¡
 R('27100b', ambushMain);
 R('27101a', { whenRevealed: async (g) => { const c = await ambush(g); if (!c || g.cfg.expert) await g.dealEncounter(g.firstPlayer()); } });
 R('27101b', ambushMain);
-R('27102a', { kw: { permanent: true, hinder: 1, hinderPerHero: true }, onCleared: async (g, s) => {
+R('27102a', { kw: { permanent: true }, onCleared: async (g, s) => {
   g.log('¡Se retira la última amenaza de La luz al final del túnel! Emboscada y se voltea: ahora podéis escapar.', 'good');
   s.code = '27102b'; s.thr = g.scaled(g.d(s).baseThreat || 0, g.d(s).baseThreatFixed); g.update();
   await ambush(g);
@@ -10324,8 +10442,8 @@ async function s6Attach(g, ci, p, pickFn) {
 }
 R('27103', { attachHost: (g, ci, p) => s6Attach(g, ci, p, (vs) => pickTie(g, vs, 'Villano con mayor orden de activación', ord)),
   stat: (g, src, tgt, s) => (s === 'atk' && g.inPlay(src) && tgt.iid === src.host ? g.villains().length + 1 : 0) });
-R('27104', { status: 'partial', attachHost: (g, ci, p) => s6Attach(g, ci, p, (vs) => pickTie(g, vs, 'Villano con más vida restante', (v) => g.hpLeft(v))) });
-R('27105', { status: 'partial', attachHost: (g, ci, p) => s6Attach(g, ci, p, (vs) => pickTie(g, vs, 'Villano con menor orden de activación', (v) => -ord(v))) });
+R('27104', { attachHost: (g, ci, p) => s6Attach(g, ci, p, (vs) => pickTie(g, vs, 'Villano con más vida restante', (v) => g.hpLeft(v))), blockRemoval: (g, src, scheme) => /^27102/.test(scheme.code) });
+R('27105', { attachHost: (g, ci, p) => s6Attach(g, ci, p, (vs) => pickTie(g, vs, 'Villano con menor orden de activación', (v) => -ord(v))) });
 R('27106', { attachHost: (g, ci, p) => s6Attach(g, ci, p, (vs) => pickTie(g, vs, 'Villano con más ATQ', (v) => g.stat(v, 'atk'))),
   forbidAttack: (g, src, p, e) => ['villain', 'villain2'].includes(e.zone) && !g.attachments(e).some((a) => a.code === '27106') });
 R('27107', { blockRemoval: (g, src, scheme) => scheme.zone === 'side' && scheme !== src, boost: async (g, ci, ctx) => { await g.giveBoost(ctx, 1); g.log('El villano recibe 1 carta de potenciación adicional.'); } });
@@ -11100,22 +11218,241 @@ async function mtsHook(g, when) {
   g.update();
 }
 
+
+// ======================= MOTIVOS SINIESTROS =======================
+const SM = {
+  key: 'sm',
+  name: 'Motivos siniestros',
+  scenarios: [
+    { villain: 'sandman', modulars: ['city_in_chaos', 'down_to_earth'] },
+    { villain: 'venom', modulars: ['down_to_earth', 'symbiotic_strength'] },
+    { villain: 'mysterio', modulars: ['personal_nightmare', 'whispers_of_paranoia'] },
+    { villain: 'sinister_six', modulars: ['guerrilla_tactics'] },
+    { villain: 'venom_goblin', modulars: ['symbiotic_strength', 'goblin_gear'] },
+  ],
+  shield: ['27182a', '27183a', '27184a', '27185a', '27186a', '27187a', '27188a', '27189a'],
+  community: ['27176', '27177', '27178', '27179', '27180'],
+  osborn: ['27147', '27148', '27149', '27150', '27151', '27152'],
+  prohibited: ['27190', '27191'],
+  healCards: [0, 1, 2, 2, 3],
+  // nodos del registro de reputación
+  nodes: [
+    { n: 1, reward: 'Se reparten 3 mejoras de Tecnología S.H.I.E.L.D. a cada jugador: elige 1 para tu mazo.', penalty: 'Tecnología de Osborn al azar (se baraja en el mazo de encuentros de cada escenario).' },
+    { n: 5, reward: 'Preparación: cada jugador puede hacer 1 mulligan adicional.', penalty: 'Preparación: +1 de amenaza por jugador en el plan principal.' },
+    { n: 9, reward: 'Ventaja de aspecto: cada jugador añade el máximo de copias de una carta de aspecto a su mazo.', penalty: 'Preparación: cada jugador se enfrenta a un esbirro del mazo de encuentros (si no hay, recibe 1 carta bocabajo).' },
+    { n: 13, reward: 'Preparación: la Tecnología S.H.I.E.L.D. se voltea a su lado Mejorado.', penalty: 'Otra Tecnología de Osborn al azar.' },
+    { n: 17, reward: 'Planificación: cada jugador elige una carta de su mazo y empieza cada escenario con ella en la mano.', penalty: 'Preparación: el primer jugador revela un plan secundario del escenario con +1 de amenaza por jugador.' },
+    { n: 21, reward: 'Preparación: cada jugador puede poner en juego un Helicarrier.', penalty: 'Otra Tecnología de Osborn al azar.' },
+    { n: 25, reward: 'Preparación: cada jugador puede poner en juego un Traje simbionte.', penalty: 'Preparación: cada jugador recibe 1 carta de encuentro bocabajo.' },
+  ],
+};
+const smVictory = (code) => { const d = MC.CARDS[code]; const m = d && /Victory (-?\d+)/i.exec((d.textEn || '').replace(/<[^>]+>/g, '')); return m ? +m[1] : 0; };
+const smAspectPool = () => MC.D.cards.filter((c) => !c.dup && ['aggression', 'justice', 'leadership', 'protection'].includes(c.fac) && ['ally', 'event', 'support', 'upgrade', 'resource'].includes(c.type)).map((c) => c.code);
+function smCreate(decks, expert) {
+  return {
+    id: 'c' + Date.now(), def: 'sm', name: SM.name, expert: !!expert, created: new Date().toISOString(),
+    step: 0, status: 'active', pending: null, history: [],
+    log: { rep: 0, community: [], waking: 0, lastStanding: [], osborn: [], final: null },
+    players: decks.map((d, i) => ({
+      num: i + 1, deckId: d.id, snapshot: { name: d.name, heroSet: d.heroSet, deck: { ...d.deck }, aspects: (d.aspects || []).slice(), netGuest: d.netGuest, netName: d.netName },
+      hp: null, defeated: false, healChoice: null, shield: null, aspectAdv: null, plan: null,
+    })),
+  };
+}
+function smPlayerDeck(cp, liveDeck) {
+  const src = liveDeck && liveDeck.heroSet === cp.snapshot.heroSet ? liveDeck : cp.snapshot;
+  const deck = { ...src.deck };
+  for (const code of SM.prohibited) delete deck[code];
+  if (cp.shield) deck[cp.shield] = 1;
+  if (cp.aspectAdv && MC.CARDS[cp.aspectAdv]) { const d = MC.CARDS[cp.aspectAdv]; deck[cp.aspectAdv] = Math.max(deck[cp.aspectAdv] || 0, d.limit || (d.unique ? 1 : 3)); }
+  return { deck, aspects: src.aspects, name: src.name, heroSet: src.heroSet };
+}
+function smBuildConfig(camp, liveDecks) {
+  const sc = SM.scenarios[camp.step];
+  const players = camp.players.map((cp) => {
+    const live = (liveDecks || []).find((d) => d.id === cp.deckId);
+    const pd = smPlayerDeck(cp, live);
+    let startDamage = 0;
+    if (camp.expert && cp.hp != null && cp.healChoice !== 'heal' && !cp.defeated) startDamage = Math.max(0, heroBaseHp(pd.heroSet) - cp.hp);
+    return { heroSet: pd.heroSet, deck: pd.deck, aspects: pd.aspects, deckName: pd.name, startDamage, netGuest: cp.snapshot.netGuest, netName: cp.snapshot.netName };
+  });
+  return {
+    players, villainSet: sc.villain, modulars: sc.modulars.slice(), expert: camp.expert,
+    standardSets: ['standard'], expertSets: ['expert'], pause: {},
+    campaign: { id: camp.id, step: camp.step, def: 'sm', log: JSON.parse(JSON.stringify(camp.log)),
+      heal: camp.players.map((cp) => cp.healChoice === 'heal' || (camp.expert && cp.defeated && cp.healChoice !== 'keep')),
+      plans: camp.players.map((cp) => cp.plan), shield: camp.players.map((cp) => cp.shield) },
+  };
+}
+function smPreChoices(camp) {
+  if (!camp.expert || camp.step === 0) return [];
+  const n = SM.healCards[camp.step];
+  return camp.players.map((cp, i) => {
+    const base = heroBaseHp(cp.snapshot.heroSet);
+    const hurt = cp.defeated || (cp.hp != null && cp.hp < base);
+    return { idx: i, hurt, mustHeal: cp.defeated, base, hp: cp.defeated ? 0 : cp.hp, cards: n };
+  }).filter((x) => x.hurt);
+}
+function smApplyHeal(camp, idx, heal) { const cp = camp.players[idx]; cp.healChoice = heal ? 'heal' : 'keep'; }
+function smRepGain(camp, report) {
+  const n = camp.players.length;
+  const vic = report.victory || [];
+  const vp = vic.reduce((s, c) => s + smVictory(c), 0);
+  const r = report.sm || {};
+  const lines = [];
+  let gain = 0;
+  if (vp) { gain += vp; lines.push((vp > 0 ? '+' : '') + vp + ' por puntos de victoria en la zona de victoria'); }
+  if (!r.sideCount) { gain++; lines.push('+1 sin planes secundarios en juego'); }
+  if ((r.accel || 0) < n) { gain++; lines.push('+1 menos de ' + n + ' fichas de aceleración'); }
+  if (!report.minionsInPlay) { gain++; lines.push('+1 sin esbirros en juego'); }
+  if (!report.mainThr) { gain++; lines.push('+1 sin amenaza en el plan principal'); }
+  if ((report.alive || []).every(Boolean)) { gain++; lines.push('+1 ninguna identidad derrotada'); }
+  return { gain: Math.max(0, gain), lines };
+}
+function smRecord(camp, win, report, round) {
+  const step = camp.step;
+  camp.history.push({ step, villain: SM.scenarios[step].villain, win, round, date: new Date().toISOString() });
+  report = report || {};
+  if (!win) { if (step === 4 && camp.expert) camp.status = 'lost'; return { retry: !(step === 4 && camp.expert) }; }
+  const alive = report.alive || camp.players.map(() => true);
+  const L = camp.log;
+  const r = report.sm || {};
+  const got = [];
+  const { gain, lines } = smRepGain(camp, report);
+  const before = L.rep || 0;
+  L.rep = before + gain;
+  got.push('Reputación: +' + gain + ' (' + before + ' → ' + L.rep + ').');
+  const crossed = SM.nodes.filter((x) => x.n > before && x.n <= L.rep);
+  const choices = [];
+  for (const nd of crossed) {
+    got.push('★ Nodo ' + nd.n + ' — Recompensa: ' + nd.reward);
+    got.push('☠ Nodo ' + nd.n + ' — Penalización: ' + nd.penalty);
+    if ([1, 13, 21].includes(nd.n)) {
+      const free = SM.osborn.filter((c) => !L.osborn.includes(c));
+      if (free.length) { const c = free[Math.floor(Math.random() * free.length)]; L.osborn.push(c); got.push('Tecnología de Osborn registrada: ' + (MC.CARDS[c] ? MC.CARDS[c].name : c) + '.'); }
+    }
+    if (nd.n === 1) {
+      const pool = SM.shield.filter((c) => !camp.players.some((cp) => cp.shield === c));
+      camp.players.forEach((cp, i) => { if (camp.expert && !alive[i]) return; const opts = MC.shuffle(pool.filter((c) => !choices.some((x) => x.kind === 'shield' && x.options.includes(c)))).slice(0, 3); if (opts.length) choices.push({ idx: i, kind: 'shield', options: opts, optional: true }); });
+    }
+    if (nd.n === 9) camp.players.forEach((cp, i) => { if (!(camp.expert && !alive[i])) choices.push({ idx: i, kind: 'aspect', options: smAspectPool(), optional: true }); });
+    if (nd.n === 17) camp.players.forEach((cp, i) => { if (!(camp.expert && !alive[i])) choices.push({ idx: i, kind: 'plan', options: Object.keys(smPlayerDeck(cp).deck), optional: true }); });
+  }
+  if (step < 4) {
+    const cs = (report.victory || []).filter((c) => SM.community.includes(c) && !L.community.includes(c));
+    for (const c of cs) { L.community.push(c); got.push('Servicio a la comunidad completado: ' + (MC.CARDS[c] ? MC.CARDS[c].name : c) + '.'); }
+  }
+  if (step === 2) { L.waking = r.illusions || 0; got.push('Pesadilla despierta: ' + L.waking + ' carta(s) de Ilusión en vuestros mazos (+' + L.waking + ' de amenaza en La luz al final del túnel).'); }
+  if (step === 3) { L.lastStanding = (r.villains || []).slice(); got.push('Los últimos en pie: ' + (L.lastStanding.length ? L.lastStanding.map((c) => MC.CARDS[c] ? MC.CARDS[c].name : c).join(', ') : 'ninguno') + ' (sus esbirros de Asalto siniestro irán contra Duende Veneno).'); }
+  camp.players.forEach((cp, i) => {
+    cp.healChoice = null;
+    if (camp.expert) {
+      if (!alive[i]) { cp.defeated = true; cp.hp = null; return; }
+      cp.defeated = false;
+      const base = heroBaseHp(cp.snapshot.heroSet);
+      cp.hp = Math.min(base, report.hp ? report.hp[i] : base);
+    }
+  });
+  if (step === 4) { camp.status = 'won'; L.final = L.rep; }
+  camp.pending = { step, got, lines, choices };
+  return { retry: false };
+}
+function smApplyRewards(camp, sel) {
+  const pend = camp.pending;
+  if (!pend) return;
+  for (const ch of pend.choices || []) {
+    const code = sel && sel[ch.kind + ':' + ch.idx];
+    if (!code) continue;
+    const cp = camp.players[ch.idx];
+    if (ch.kind === 'shield') cp.shield = code;
+    if (ch.kind === 'aspect') cp.aspectAdv = code;
+    if (ch.kind === 'plan') cp.plan = code;
+  }
+  camp.pending = null;
+  if (camp.status === 'active') camp.step++;
+}
+async function smHook(g, when) {
+  const cc = g.cfg.campaign; const log = cc.log || {}; const step = cc.step; const rep = log.rep || 0;
+  const L = root.MC_FX.L; const x = g.cfg.expert; const fp = g.firstPlayer(); const n = g.nPlayers();
+  const mkEnc = (code) => g.mk(code, null, 'enc.deck');
+  if (when === 'pre') {
+    g.log('— Preparación de campaña: ' + SM.name + ' (escenario ' + (step + 1) + ', reputación ' + rep + ') —', 'phase');
+    // Clamor popular
+    const po = g.mk(x ? '27174b' : '27174a', null, 'env');
+    po.ctr = (x ? 3 : 2) * n; po.x.usesMax = po.ctr;
+    g.log('Clamor popular entra en juego con ' + po.ctr + ' contadores de notoriedad.', 'bad');
+    mkEnc('27175');
+    if (step === 2 || step === 3) {
+      const v = g.mk('27190', fp.idx, g.pz(fp, 'play')); v.ctrl = fp.idx; g.log('Veneno (Eddie Brock) entra en juego bajo el control de ' + fp.name + '.', 'good');
+      mkEnc('27181');
+    }
+    if (step < 4) {
+      const free = SM.community.filter((c) => !(log.community || []).includes(c));
+      if (free.length) mkEnc(free[Math.floor(Math.random() * free.length)]);
+    }
+    if (step === 3 && log.waking) { const l = g.sideSchemes().find((s) => /^27102/.test(s.code)); if (l) { l.thr += log.waking; g.log('Pesadilla despierta: +' + log.waking + ' de amenaza en La luz al final del túnel.', 'bad'); } }
+    if (step === 4) for (const vc of log.lastStanding || []) {
+      const nm = MC.CARDS[vc] && MC.CARDS[vc].nameEn;
+      const m = MC.D.cards.find((c) => c.set === 'sinister_assault' && !c.dup && c.nameEn === nm);
+      if (m) { mkEnc(m.code); g.log('Asalto siniestro: ' + m.name + ' se baraja en el mazo de encuentros.', 'bad'); }
+    }
+    if (rep >= 1) for (const c of log.osborn || []) { mkEnc(c); g.log('Tecnología de Osborn: ' + (MC.CARDS[c] ? MC.CARDS[c].name : c) + ' se baraja en el mazo de encuentros.', 'bad'); }
+    MC.shuffle(g.z('enc.deck'));
+    // reputación — lado izquierdo (recompensas con Preparación)
+    if (rep >= 5) { g.extraMulligan = 1; g.log('Reputación 5: cada jugador puede hacer 1 mulligan adicional.', 'good'); }
+    if (rep >= 13) for (const p of g.players) for (const c of g.cards(g.pz(p, 'play')).filter((c) => SM.shield.includes(c.code))) { c.code = c.code.replace(/a$/, 'b'); g.log(p.name + ': ' + g.d(c).name + ' se voltea a su lado Mejorado.', 'good'); }
+    if (rep >= 21) for (const p of g.players) { const h = g.mk('01092', p.idx, g.pz(p, 'play')); h.ctrl = p.idx; await g.afterEnter(h, p); g.log('Reputación 21: ' + p.name + ' pone en juego un Helicarrier.', 'good'); }
+    if (rep >= 25) for (const p of g.players) { const s = g.mk('27191', p.idx, g.pz(p, 'play')); s.ctrl = p.idx; await g.afterEnter(s, p); g.log('Reputación 25: ' + p.name + ' pone en juego un Traje simbionte.', 'good'); }
+    // reputación — lado derecho (penalizaciones con Preparación)
+    if (rep >= 5 && g.main()) { await g.placeThreat(g.main(), n, { silent: true }); g.log('Reputación 5: +' + n + ' de amenaza en el plan principal.', 'bad'); }
+    if (rep >= 9) for (const p of g.order()) {
+      const m = await g.searchEncounter((d) => d.type === 'minion');
+      if (m) await g.engageMinion(m, p, { cancelWR: true }); else await g.dealEncounter(p, 1);
+    }
+    if (rep >= 17) {
+      const vset = g.cfg.villainSet;
+      const ss = await g.searchEncounter((d) => d.type === 'side_scheme' && d.set === vset);
+      if (ss) { await g.reveal(ss, fp); if (g.inPlay(ss)) await g.placeThreat(ss, n); }
+    }
+    if (rep >= 25) for (const p of g.order()) await g.dealEncounter(p, 1);
+    // experto
+    if (x) {
+      const heal = cc.heal || [];
+      for (const p of g.players) if (heal[p.idx] && SM.healCards[step]) { const me = g.idOf(p); me.dmg = 0; await g.dealEncounter(p, SM.healCards[step]); g.log(p.name + ' recupera toda su vida a cambio de ' + SM.healCards[step] + ' carta(s) de encuentro bocabajo.'); }
+      if (step === 0) { const cs = g.cards('env').find((c) => c.code === '27065'); if (cs) { cs.ctr = (cs.ctr || 0) + 2; g.log('Experto: +2 contadores de arena.'); const S = root.MC_SM; if (S && S.surgingSands) await S.surgingSands(g); } }
+      if (step === 1) for (const p of g.players) { const me = g.idOf(p); me.x.fdBoost = (me.x.fdBoost || 0) + 1; g.log('Experto: ' + p.name + ' recibe 1 carta de potenciación bocabajo en su identidad.'); }
+      if (step === 2) for (const p of g.order()) { for (let k = 0; k < 2; k++) { const c = await g.drawEncounterCard(); if (!c) break; g.resetCard(c); g.put(c, g.pz(p, 'deck')); } MC.shuffle(g.z(g.pz(p, 'deck'))); g.log('Experto: 2 cartas de encuentro se barajan en el mazo de ' + p.name + '.'); }
+      if (step === 4) for (const m of [...g.cards('main'), ...g.cards('main2')]) await g.placeThreat(m, n, { silent: true });
+    }
+    g.update();
+  } else if (when === 'post') {
+    if (rep >= 17) for (const p of g.players) {
+      const code = (cc.plans || [])[p.idx]; if (!code) continue;
+      const c = [...g.cards(g.pz(p, 'deck')), ...g.cards(g.pz(p, 'discard'))].find((y) => y.code === code);
+      MC.shuffle(g.z(g.pz(p, 'deck')));
+      if (c) { g.put(c, g.pz(p, 'hand')); g.log('Planificación: ' + p.name + ' añade ' + g.d(c).name + ' a su mano.', 'good'); }
+    }
+    void L;
+  }
+}
+
 // ======================= despacho por campaña =======================
-const DEFS = { rrs: RRS, gmw: GMW, mts: MTS };
+const DEFS = { rrs: RRS, gmw: GMW, mts: MTS, sm: SM };
 const defOf = (c) => DEFS[(c && c.def) || 'rrs'];
 const isG = (c) => c && c.def === 'gmw';
 const isM = (c) => c && c.def === 'mts';
-async function hook(g, when) { const cc = g.cfg.campaign; if (cc && cc.def === 'gmw') return gmwHook(g, when); if (cc && cc.def === 'mts') return mtsHook(g, when); }
+const isS = (c) => c && c.def === 'sm';
+async function hook(g, when) { const cc = g.cfg.campaign; if (cc && cc.def === 'sm') return smHook(g, when); if (cc && cc.def === 'gmw') return gmwHook(g, when); if (cc && cc.def === 'mts') return mtsHook(g, when); }
 root.MC_CAMPAIGN = {
-  RRS, GMW, MTS, DEFS, defOf, hook,
-  create: (decks, expert, def) => (def === 'gmw' ? gmwCreate(decks, expert) : def === 'mts' ? mtsCreate(decks, expert) : create(decks, expert)),
-  buildConfig: (camp, live) => (isM(camp) ? mtsBuildConfig(camp, live) : isG(camp) ? gmwBuildConfig(camp, live) : buildConfig(camp, live)),
-  recordResult: (camp, win, report, round) => (isM(camp) ? mtsRecord(camp, win, report, round) : isG(camp) ? gmwRecord(camp, win, report, round) : recordResult(camp, win, report, round)),
-  applyRewards: (camp, sel) => (isM(camp) ? mtsApplyRewards(camp, sel) : isG(camp) ? gmwApplyRewards(camp, sel) : applyRewards(camp, sel)),
-  preScenarioChoices: (camp) => (isM(camp) ? [] : isG(camp) ? gmwPreChoices(camp) : preScenarioChoices(camp)),
-  applyHealChoice: (camp, idx, o) => (isG(camp) ? gmwApplyHeal(camp, idx, !!o) : applyHealChoice(camp, idx, o)),
-  playerDeck: (cp, live, camp) => (isM(camp) ? mtsPlayerDeck(cp, live, camp) : isG(camp) ? gmwPlayerDeck(cp, live) : playerDeck(cp, live)),
-  gmwBuy, gmwSell, gmwOwned, heroBaseHp, villainName,
+  RRS, GMW, MTS, SM, DEFS, defOf, hook,
+  create: (decks, expert, def) => (def === 'sm' ? smCreate(decks, expert) : def === 'gmw' ? gmwCreate(decks, expert) : def === 'mts' ? mtsCreate(decks, expert) : create(decks, expert)),
+  buildConfig: (camp, live) => (isS(camp) ? smBuildConfig(camp, live) : isM(camp) ? mtsBuildConfig(camp, live) : isG(camp) ? gmwBuildConfig(camp, live) : buildConfig(camp, live)),
+  recordResult: (camp, win, report, round) => (isS(camp) ? smRecord(camp, win, report, round) : isM(camp) ? mtsRecord(camp, win, report, round) : isG(camp) ? gmwRecord(camp, win, report, round) : recordResult(camp, win, report, round)),
+  applyRewards: (camp, sel) => (isS(camp) ? smApplyRewards(camp, sel) : isM(camp) ? mtsApplyRewards(camp, sel) : isG(camp) ? gmwApplyRewards(camp, sel) : applyRewards(camp, sel)),
+  preScenarioChoices: (camp) => (isS(camp) ? smPreChoices(camp) : isM(camp) ? [] : isG(camp) ? gmwPreChoices(camp) : preScenarioChoices(camp)),
+  applyHealChoice: (camp, idx, o) => (isS(camp) ? smApplyHeal(camp, idx, !!o) : isG(camp) ? gmwApplyHeal(camp, idx, !!o) : applyHealChoice(camp, idx, o)),
+  playerDeck: (cp, live, camp) => (isS(camp) ? smPlayerDeck(cp, live) : isM(camp) ? mtsPlayerDeck(cp, live, camp) : isG(camp) ? gmwPlayerDeck(cp, live) : playerDeck(cp, live)),
+  gmwBuy, gmwSell, gmwOwned, heroBaseHp, villainName, smRepGain,
 };
 })(typeof window !== 'undefined' ? window : globalThis);
 
@@ -12981,17 +13318,24 @@ function renderCampaign() {
   const DEF = CPN.defOf(c);
   const gmw = c.def === 'gmw';
   const mts = c.def === 'mts';
+  const smc = c.def === 'sm';
   const ds = allDecks();
   const steps = DEF.scenarios.map((sc, i) => h('div', { class: 'cstep' + (i < c.step || (i === c.step && c.status === 'won') ? ' done' : i === c.step ? ' now' : '') },
     h('div', { class: 'cnum' }, i + 1), iconImg(sc.villain, 'small'), h('div', {}, CPN.villainName(sc.villain))));
   const body = [];
-  if (c.status === 'won') body.push(h('div', { class: 'panel cwin' }, h('h3', {}, '🏆 ¡Campaña completada!'), h('p', {}, mts ? 'Habéis derrotado a Loki: Asgard y la galaxia están a salvo de la sombra de Thanos.' : gmw ? 'Habéis derrotado a Ronan el Acusador: la galaxia está a salvo.' : 'Habéis derrotado a Cráneo Rojo.')));
-  if (c.status === 'lost') body.push(h('div', { class: 'panel closs' }, h('h3', {}, mts ? '💀 Loki se queda con el trono de Asgard' : gmw ? '💀 Ronan reclama la Gema del Poder' : '💀 Cráneo Rojo conquista el mundo'), h('p', {}, 'La campaña se ha perdido en el escenario final.')));
-  if (c.pending) body.push(mts ? renderMtsRewards(c) : gmw ? renderGmwRewards(c) : renderRewards(c));
+  if (c.status === 'won') body.push(h('div', { class: 'panel cwin' }, h('h3', {}, '🏆 ¡Campaña completada!'), h('p', {}, smc ? 'Habéis derrotado al Duende Veneno: Nueva York está a salvo. Reputación final: ' + (c.log.final != null ? c.log.final : c.log.rep) + '.' : mts ? 'Habéis derrotado a Loki: Asgard y la galaxia están a salvo de la sombra de Thanos.' : gmw ? 'Habéis derrotado a Ronan el Acusador: la galaxia está a salvo.' : 'Habéis derrotado a Cráneo Rojo.')));
+  if (c.status === 'lost') body.push(h('div', { class: 'panel closs' }, h('h3', {}, smc ? '💀 El Duende Veneno toma el control de Nueva York' : mts ? '💀 Loki se queda con el trono de Asgard' : gmw ? '💀 Ronan reclama la Gema del Poder' : '💀 Cráneo Rojo conquista el mundo'), h('p', {}, 'La campaña se ha perdido en el escenario final.')));
+  if (c.pending) body.push(smc ? renderSmRewards(c) : mts ? renderMtsRewards(c) : gmw ? renderGmwRewards(c) : renderRewards(c));
   else if (c.status === 'active') body.push(renderNextScenario(c, ds));
   const log = c.log;
   const yn = (b) => (b ? 'Sí' : 'No');
-  const rows = mts ? [
+  const rows = smc ? [
+    ['Reputación', String(log.rep || 0) + ' nodo(s)' + (CPN.SM.nodes.filter((x) => x.n <= (log.rep || 0)).length ? ' — alcanzados: ' + CPN.SM.nodes.filter((x) => x.n <= (log.rep || 0)).map((x) => x.n).join(', ') : '')],
+    ['Servicio a la comunidad completado', log.community.length ? log.community.map(cardName).join(', ') : '—'],
+    ['Pesadilla despierta', String(log.waking || 0)],
+    ['Los últimos en pie', log.lastStanding.length ? log.lastStanding.map(cardName).join(', ') : '—'],
+    ['Tecnología de Osborn', log.osborn.length ? log.osborn.map(cardName).join(', ') : '—'],
+  ] : mts ? [
     ['Cosmo en la reserva de campaña', yn(log.cosmo)],
     ['Brecha de seguridad en la reserva', yn(log.securityBreach)],
     ['Shawarma en la reserva', yn(log.shawarma)],
@@ -13028,6 +13372,10 @@ function renderCampaign() {
             gmw ? h('span', { class: 'pill gold' }, '◎ ' + (cp.units || 0) + ' créditos') : null),
           c.expert ? h('div', {}, 'Vida: ' + (cp.hp == null ? 'completa' : cp.hp + ' / ' + CPN.heroBaseHp(cp.snapshot.heroSet)) + (cp.defeated ? ' — derrotado' : '')) : null,
           gmw ? h('div', { class: 'cchips' }, cp.market.map((x) => h('span', { class: 'pill blue', 'data-code': x }, '🛒 ' + cardName(x)))) :
+          smc ? h('div', { class: 'cchips' },
+            cp.shield ? h('span', { class: 'pill blue', 'data-code': (log.rep || 0) >= 13 ? cp.shield.replace(/a$/, 'b') : cp.shield }, '⚙ ' + cardName(cp.shield) + ((log.rep || 0) >= 13 ? ' (Mejorada)' : '')) : null,
+            cp.aspectAdv ? h('span', { class: 'pill gold', 'data-code': cp.aspectAdv }, '★ Ventaja de aspecto: ' + cardName(cp.aspectAdv)) : null,
+            cp.plan ? h('span', { class: 'pill green', 'data-code': cp.plan }, '✋ Planificación: ' + cardName(cp.plan)) : null) :
           mts ? h('div', { class: 'cchips' }, [log.shawarma && '21183', log.systemShock && '21185', log.norn && '21187a'].filter(Boolean).map((x) => h('span', { class: 'pill ' + (x === '21185' ? 'red' : 'blue'), 'data-code': x }, (x === '21185' ? '⚠ ' : '➕ ') + cardName(x)))) :
           h('div', { class: 'cchips' },
             cp.tech.map((x) => h('span', { class: 'pill blue', 'data-code': x }, '⚙ ' + cardName(x))),
@@ -13042,6 +13390,7 @@ function campaignCards(key) {
   let l = [];
   if (key === 'rrs') l = [...D.tech, ...Object.keys(D.improved), ...D.obligations];
   else if (key === 'gmw') l = [...D.artifacts, ...D.market().map((m) => m.code)];
+  else if (key === 'sm') l = [...D.shield, ...D.community, '27174a', '27175', '27181'];
   else l = MC.D.cards.filter((c) => c.set === 'mts_campaign' && !c.dup).map((c) => c.code);
   return l.filter((c) => CARDS[c]);
 }
@@ -13052,11 +13401,12 @@ function renderCampaignNew() {
   const old = campaigns();
   if (!ds.length) return h('main', { class: 'page' }, h('h2', {}, 'Campaña'), h('p', {}, 'Primero crea un mazo.'), h('button', { class: 'btn primary', onclick: () => setScreen('decks') }, 'Ir al constructor'));
   const DESC = {
+    sm: 'Cinco escenarios en orden: Sandman, Veneno, Mysterio, los Seis Siniestros y Duende Veneno. Un registro de reputación del grupo da recompensas (Tecnología S.H.I.E.L.D., ventaja de aspecto, planificación, Helicarrier, Traje simbionte) pero los villanos responden con Tecnología de Osborn y más amenaza. Hay Servicio a la comunidad, Clamor popular y Veneno como aliado incómodo.',
     mts: 'Cinco escenarios en orden: Fauces de Ébano, Defensa de la torre, Thanos, Hela y Loki. Cada escenario tiene un plan secundario de campaña: si lo derrotáis ganáis aliados y cartas (Cosmo, Shawarma, Piedras de las Nornas, Odín…); si no, os persigue (Brecha de seguridad, Cisne Negro, Descarga del sistema).',
     rrs: 'Cinco escenarios en orden: Crossbones, Hombre Absorbente, Supervisor, Zola y Cráneo Rojo. Ganar cada uno da recompensas (armas experimentales, mejoras, aliados rescatados) que se usan en los siguientes.',
     gmw: 'Cinco escenarios en orden: Drang, el Coleccionista (dos partes), Nebula y Ronan. Ganáis créditos para comprar cartas del Mercado, y lo que pasa en cada escenario (La Colección, artefactos, Gema del Poder, evasión, cazarrecompensas) afecta a los siguientes.',
   };
-  const EXPERT = { gmw: 'La vida se arrastra entre escenarios; puedes curarte gastando créditos.', mts: 'La vida se arrastra entre escenarios y se añade «Convocado de entre los muertos» al mazo de encuentros.', rrs: 'La vida se arrastra entre escenarios; hay obligaciones de campaña para curarse.' };
+  const EXPERT = { sm: 'La vida se arrastra; podéis curaros recibiendo cartas de encuentro bocabajo. Si perdéis contra Duende Veneno, se pierde la campaña.', gmw: 'La vida se arrastra entre escenarios; puedes curarte gastando créditos.', mts: 'La vida se arrastra entre escenarios y se añade «Convocado de entre los muertos» al mazo de encuentros.', rrs: 'La vida se arrastra entre escenarios; hay obligaciones de campaña para curarse.' };
   const MAX = { one: 1, two: 2, multi: 4 };
   const max = MAX[st.mode];
   st.decks = st.decks.filter((id) => ds.find((d) => d.id === id)).slice(0, max);
@@ -13131,7 +13481,16 @@ function renderNextScenario(c, ds) {
   const pending = pre.filter((x) => c.players[x.idx].healChoice == null);
   const last = c.history[c.history.length - 1];
   const notes = [];
-  if (c.def === 'mts') {
+  if (c.def === 'sm') {
+    const L = c.log, r = L.rep || 0;
+    notes.push('Clamor popular entra en juego (' + (c.expert ? 3 : 2) + ' contadores de notoriedad por jugador) y Campaña de difamación se baraja en el mazo de encuentros.');
+    if (c.step < 4) notes.push('Se baraja un Servicio a la comunidad al azar' + (L.community.length ? ' (no se repiten: ' + L.community.map(cardName).join(', ') + ')' : '') + '.');
+    if (c.step === 2 || c.step === 3) notes.push('Veneno (Eddie Brock) empieza en juego como aliado del primer jugador, y No hay traición sin castigo se baraja en el mazo.');
+    if (c.step === 3 && L.waking) notes.push('Pesadilla despierta: +' + L.waking + ' de amenaza en La luz al final del túnel.');
+    if (c.step === 4 && L.lastStanding.length) notes.push('Asalto siniestro: se barajan los esbirros de ' + L.lastStanding.map(cardName).join(', ') + '.');
+    for (const nd of CPN.SM.nodes) if (nd.n <= r && nd.n !== 9) notes.push('Reputación ' + nd.n + ': ' + nd.reward + ' / ' + nd.penalty);
+    if (c.expert) notes.push(['Experto: +2 contadores de arena y se resuelven las Arenas crecientes.', 'Experto: 1 carta de potenciación bocabajo en cada identidad.', 'Experto: cada jugador baraja 2 cartas de encuentro en su mazo.', '', 'Experto: +1 de amenaza por jugador en cada plan principal. Si perdéis, se pierde la campaña.'][c.step]);
+  } else if (c.def === 'mts') {
     const L = c.log;
     notes.push('Se revela el plan secundario de campaña «' + cardName(sc.camp) + '».');
     if (c.step >= 1 && L.cosmo) notes.push('Cosmo empieza en juego bajo el control del primer jugador.');
@@ -13170,8 +13529,9 @@ function renderNextScenario(c, ds) {
       const cp = c.players[x.idx];
       return h('div', { class: 'cchoice' },
         h('b', {}, heroName(cp.snapshot.heroSet) + ': '), x.mustHeal ? 'fue derrotado; debe añadir una obligación para volver a jugar.' : 'tiene ' + x.hp + '/' + x.base + ' de vida.',
-        cp.healChoice ? h('span', { class: 'pill green' }, cp.healChoice === 'heal' ? (gmw ? 'Curado (1 crédito gastado)' : 'Curado (obligación añadida)') : 'Juega con el daño') :
+        cp.healChoice ? h('span', { class: 'pill green' }, cp.healChoice === 'heal' ? (c.def === 'sm' ? 'Vida completa (recibirá ' + x.cards + ' carta(s) de encuentro bocabajo)' : gmw ? 'Curado (1 crédito gastado)' : 'Curado (obligación añadida)') : 'Juega con el daño') :
           h('div', { class: 'row gap wrap' },
+            c.def === 'sm' ? h('button', { class: 'btn small', onclick: () => { CPN.applyHealChoice(c, x.idx, true); saveCampaign(c); render(); } }, (x.mustHeal ? 'Volver a la partida' : 'Recuperar toda la vida') + ' recibiendo ' + x.cards + ' carta(s) de encuentro bocabajo') :
             gmw ? h('button', { class: 'btn small', onclick: () => { CPN.applyHealChoice(c, x.idx, true); saveCampaign(c); render(); } }, 'Curarse por completo (gastar 1 crédito)') :
               x.free.map((o) => h('button', { class: 'btn small', 'data-code': o, onclick: () => { CPN.applyHealChoice(c, x.idx, o); saveCampaign(c); render(); } }, 'Curarse añadiendo «' + cardName(o) + '»')),
             !x.mustHeal ? h('button', { class: 'btn small', onclick: () => { CPN.applyHealChoice(c, x.idx, null); saveCampaign(c); render(); } }, 'Jugar con el daño') : null));
@@ -13212,6 +13572,30 @@ function renderGmwRewards(c) {
       h('p', { class: 'muted' }, 'Los créditos que no gastéis se guardan para más adelante. Las cartas compradas quedan en el mazo el resto de la campaña.'),
     ] : null,
     h('button', { class: 'btn big primary', onclick: () => { CPN.applyRewards(c, {}); UI.shopFor = null; saveCampaign(c); render(); } }, last ? 'Cerrar' : 'Continuar al siguiente escenario'));
+}
+function renderSmRewards(c) {
+  const pend = c.pending;
+  const sel = UI.rewardSel || (UI.rewardSel = {});
+  const last = c.status === 'won';
+  const T = { shield: 'elige 1 mejora de Tecnología S.H.I.E.L.D. (o ninguna)', aspect: 'elige una carta de aspecto para Ventaja de aspecto', plan: 'elige una carta de su mazo para Planificación' };
+  const q = UI.smAspQ || '';
+  const choiceEl = (ch) => {
+    const key = ch.kind + ':' + ch.idx;
+    let opts = ch.options;
+    if (ch.kind === 'aspect') opts = opts.filter((code) => !q || (cardName(code) + ' ' + (CARDS[code].nameEn || '')).toLowerCase().includes(q.toLowerCase())).slice(0, 24);
+    return h('div', { class: 'cchoice' },
+      h('b', {}, heroName(c.players[ch.idx].snapshot.heroSet) + ' ' + T[ch.kind] + ':'),
+      ch.kind === 'aspect' ? h('input', { type: 'search', placeholder: 'Buscar carta de aspecto…', value: q, oninput: (e) => { UI.smAspQ = e.target.value; render(); setTimeout(() => { const el = document.querySelector('.cchoice input[type=search]'); if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); } }, 0); } }) : null,
+      sel[key] ? h('div', { class: 'pill gold' }, 'Elegida: ' + cardName(sel[key])) : null,
+      h('div', { class: 'rgrid' }, opts.map((code) => h('div', { class: 'rcard' + (sel[key] === code ? ' on' : ''), onclick: () => { sel[key] = sel[key] === code ? null : code; render(); } }, cardThumb(code), h('div', { class: 'sname' }, cardName(code))))));
+  };
+  return h('section', { class: 'panel crew' },
+    h('h3', {}, '🏅 Victoria contra ' + CPN.villainName(CPN.SM.scenarios[pend.step].villain)),
+    (pend.lines || []).length ? h('div', { class: 'cnote' }, 'Condiciones cumplidas: ' + pend.lines.join(' · ')) : h('div', { class: 'cnote' }, 'No se cumplió ninguna condición de reputación.'),
+    pend.got.map((l) => h('div', { class: 'cnote' }, '• ' + l)),
+    (pend.choices || []).map(choiceEl),
+    c.expert ? h('p', { class: 'muted' }, 'Experto: cada héroe conserva la vida que le quedaba; un héroe derrotado podrá volver recibiendo cartas de encuentro.') : null,
+    h('button', { class: 'btn big primary', onclick: () => { CPN.applyRewards(c, sel); UI.rewardSel = null; UI.smAspQ = ''; saveCampaign(c); render(); } }, last ? 'Cerrar' : 'Continuar al siguiente escenario'));
 }
 function renderRewards(c) {
   const pend = c.pending;
