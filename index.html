@@ -16234,11 +16234,35 @@ function makeIO(opts = {}) {
         const g = opts.game && opts.game();
         const hero = o.find((x) => x.value === 'hero');
         const ally = o.find((x) => x.value && x.value !== 'hero' && x.value !== 'none');
-        if (g && hero) { const p = g.players[q.player] || g.players[0]; const me = g.idOf(p); if (g.hpLeft(me) > 6) return 'hero'; }
+        const none = o.find((x) => x.value === 'none');
+        // defender agota al héroe para su próximo turno: aliado primero; sin defensa si aguanta bien el golpe
         if (ally) return ally.value;
-        return hero ? 'hero' : (o.find((x) => x.value === 'none') || o[0]).value;
+        if (g) { const p = g.players[q.player] || g.players[0]; const me = g.idOf(p); const atk = g.attackCtx && g.attackCtx.enemy ? g.stat(g.attackCtx.enemy, 'atk') + 2 : 4;
+          if (none && g.hpLeft(me) > atk + 4) return 'none';
+          if (hero) return 'hero'; }
+        return hero ? 'hero' : (none || o[0]).value;
       }
       if (q.window) return Math.random() < 0.6 && real.length ? real[0].value : null; // respuestas: suele usarlas
+      // objetivos: enemigos y planes
+      const g2 = opts.game && opts.game();
+      if (g2 && real.length > 1 && real.every((x) => x.iid != null && g2.C[x.iid])) {
+        const cs = real.map((x) => ({ x, c: g2.C[x.iid] }));
+        const en = g2.enemies();
+        if (cs.every((o) => en.includes(o.c))) {
+          // remata esbirros heridos; si no, al villano
+          const mins = cs.filter((o) => g2.isMinion(o.c)).sort((a, b) => g2.hpLeft(a.c) - g2.hpLeft(b.c));
+          if (mins.length) return mins[0].x.value;
+          const v = cs.find((o) => !g2.isMinion(o.c)); if (v) return v.x.value;
+          return (mins[0] || cs[0]).x.value;
+        }
+        const sch = g2.schemes ? g2.schemes() : [];
+        if (cs.every((o) => sch.includes(o.c))) {
+          const m = g2.main();
+          const side = cs.filter((o) => o.c !== m && o.c.thr > 0).sort((a, b) => b.c.thr - a.c.thr);
+          if (m && cs.some((o) => o.c === m) && g2.threshold(m) && m.thr >= g2.threshold(m) * 0.5) return cs.find((o) => o.c === m).x.value;
+          return (side[0] || cs[0]).x.value;
+        }
+      }
       if (/mulligan/i.test(q.title || '')) return null;
       if (!real.length) return (o[0] || {}).value;
       const yes = real.find((x) => x.value === true); if (yes && Math.random() < 0.7) return yes.value;
@@ -16269,7 +16293,7 @@ function makeIO(opts = {}) {
       for (let k = 0; k < 14 && !g.over && p.alive; k++) {
         const me = g.idOf(p);
         const hero = g.isHeroForm(p);
-        if (hero && g.hpLeft(me) <= 4 && g.canFlip(p)) { await g.act(() => g.flip(p)); continue; }
+        if (hero && g.hpLeft(me) <= 3 && g.canFlip(p)) { await g.act(() => g.flip(p)); continue; }
         if (!hero && g.hpLeft(me) <= Math.ceil(g.maxHp(me) / 2) && g.canBasic(p, 'recover')) { await g.act(() => g.basicRecover(p)); continue; }
         if (!hero && g.canFlip(p) && g.hpLeft(me) > 5) { await g.act(() => g.flip(p)); continue; }
         // cartas jugables (aliados y mejoras antes que eventos)
@@ -16277,8 +16301,10 @@ function makeIO(opts = {}) {
         hand.sort((a, b) => (typeRank[g.d(a).type] ?? 3) - (typeRank[g.d(b).type] ?? 3) || (g.d(b).cost || 0) - (g.d(a).cost || 0));
         if (hand.length && Math.random() < 0.85) { const before = g.z(g.pz(p, 'hand')).length; await g.act(() => g.playCard(p, hand[0])); if (g.z(g.pz(p, 'hand')).length !== before) continue; }
         const m = g.main();
-        const danger = m && g.threshold(m) && m.thr >= g.threshold(m) * 0.55;
-        if (danger && g.canBasic(p, 'thwart')) { await g.act(() => g.basicThwart(p)); continue; }
+        const thr = m && g.threshold(m) ? m.thr / g.threshold(m) : 0;
+        const danger = thr >= 0.4 || g.sideSchemes().some((x) => (x.thr || 0) > 0 && (g.d(x).crisis || g.kw(x, 'acceleration')));
+        const thwFirst = hero && g.stat(me, 'thw') > g.stat(me, 'atk') && m && m.thr > 0;
+        if ((danger || thwFirst) && g.canBasic(p, 'thwart')) { await g.act(() => g.basicThwart(p)); continue; }
         if (g.canBasic(p, 'attack')) { await g.act(() => g.basicAttack(p)); continue; }
         if (g.canBasic(p, 'thwart')) { await g.act(() => g.basicThwart(p)); continue; }
         let did = false;
@@ -18358,7 +18384,8 @@ function renderPvpSetup(ds, modeTabs) {
     return h('section', { class: 'panel pvpteam ' + side },
       h('h3', {}, (side === 'registration' ? '🛡 ' : '✊ ') + MC_PVP.SIDE_ES[side]),
       h('div', { class: 'row gap wrap' }, h('span', {}, 'Lo juega: '),
-        [['human', 'Persona'], ['bot', 'Bot']].map(([k, l]) => h('button', { class: 'btn small' + (T.ctrl === k ? ' primary' : ''), onclick: () => { T.ctrl = k; render(); } }, l))),
+        [['human', 'Persona'], ['bot', 'Bot']].concat(NET.role === 'host' ? [['online', '🌐 Online']] : []).map(([k, l]) => h('button', { class: 'btn small' + (T.ctrl === k ? ' primary' : ''), onclick: () => { T.ctrl = k; if (k === 'online') { const nd = netDecks(); if (nd.length) T.decks = [nd[0].id]; else toast('Todavía no hay invitados con mazo en la sala.', 'bad'); } render(); } }, l))),
+      T.ctrl === 'online' ? h('div', { class: 'muted' }, 'Elige los mazos 🌐 de los invitados que jugarán este bando desde su dispositivo.') : null,
       h('div', { class: 'muted' }, 'Héroes del equipo (1 o 2):'),
       T.decks.map((id, i) => h('div', { class: 'row gap' },
         h('select', { class: 'grow', onchange: (e) => { T.decks[i] = e.target.value; render(); } }, ds.map((d) => h('option', { value: d.id, selected: d.id === id }, d.name))),
@@ -18386,6 +18413,8 @@ function renderPvpSetup(ds, modeTabs) {
       if (T.modulars.length < 3) errs.push(MC_PVP.SIDE_ES[side] + ': elige 3 o 4 módulos.');
     }
     if (st.registration.ctrl === 'bot' && st.resistance.ctrl === 'bot') errs.push('Al menos un equipo debe jugarlo una persona.');
+    for (const side of ['registration', 'resistance']) { const T = st[side]; if (T.ctrl === 'online' && !T.decks.every((id) => /^net:/.test(id))) errs.push(MC_PVP.SIDE_ES[side] + ': en un equipo online todos los héroes deben ser mazos 🌐 de invitados.'); if (T.ctrl !== 'online' && T.decks.some((id) => /^net:/.test(id))) errs.push(MC_PVP.SIDE_ES[side] + ': los mazos 🌐 de invitados solo pueden ir en un equipo «Online».'); }
+    if (st.registration.ctrl === 'online' && st.resistance.ctrl === 'online') errs.push('El anfitrión debe jugar uno de los dos equipos (o el bot).');
     if (errs.length) { uiAlert(errs.join('\n')); return; }
     startPvp(st, ds);
   };
@@ -18399,7 +18428,7 @@ function renderPvpSetup(ds, modeTabs) {
 function startPvp(st, ds) {
   const teamCfg = (side) => {
     const T = st[side];
-    const players = T.decks.map((id) => ds.find((d) => d.id === id)).filter(Boolean).map((d) => ({ heroSet: d.heroSet, deck: d.deck, aspects: d.aspects, deckName: d.name }));
+    const players = T.decks.map((id) => ds.find((d) => d.id === id)).filter(Boolean).map((d) => ({ heroSet: d.heroSet, deck: d.deck, aspects: d.aspects, deckName: d.name, netGuest: d.netGuest, netName: d.netName, name: d.netName }));
     return { players, leader: T.leader, mains: T.mains.slice(), modulars: T.modulars.slice() };
   };
   UI.rivalLog = [];
@@ -18410,13 +18439,16 @@ function startPvp(st, ds) {
       io.bind = (g) => { gref = g; };
       return io;
     }
-    const io = makeIO();
+    if (st[side].ctrl === 'online') return pvpRemoteIO(side);
+    const gref = { g: null };
+    const io = NET.role === 'host' ? netWrapIO(makeIO(), () => gref.g) : makeIO();
+    io.bind = (g) => { gref.g = g; };
     io.save = null;
     io.gameOver = () => render();
     return io;
   };
   const m = new MC_PVP.Match({ registration: teamCfg('registration'), resistance: teamCfg('resistance'), expert: st.expert, ioFor });
-  for (const side of ['registration', 'resistance']) { const g = m.games[side]; if (g.io.bind) g.io.bind(g); g.pvpHuman = st[side].ctrl === 'human'; }
+  for (const side of ['registration', 'resistance']) { const g = m.games[side]; if (g.io.bind) g.io.bind(g); g.pvpHuman = st[side].ctrl === 'human'; g.pvpCtrl = st[side].ctrl; }
   const humans = ['registration', 'resistance'].filter((s) => st[s].ctrl === 'human');
   UI.match = m; UI.g = m.games[humans[0]]; UI.stack = []; UI.turn = null; UI.nodes.clear(); UI.focusP = null;
   m.listeners.push(async (ev, x) => {
@@ -18424,35 +18456,78 @@ function startPvp(st, ds) {
       UI.g = x.game; UI.stack = []; UI.turn = null; UI.nodes.clear(); UI.focusP = null; render();
       if (humans.length > 1) await new Promise((res) => pushPrompt({ kind: 'phase', q: { title: 'Turno del equipo de ' + MC_PVP.SIDE_ES[x.side], sub: 'Pasad el dispositivo al otro equipo', kind: 'stage' } }, res));
     }
-    if (ev === 'end') { recordHistory(UI.g, x.winner && humans.includes(x.winner) ? 'win' : 'loss'); toast((x.winner ? '⚔ Gana ' + MC_PVP.SIDE_ES[x.winner] + '. ' : '') + x.why, x.winner && humans.includes(x.winner) ? 'good' : 'bad', 10000); }
-    render();
+    if (ev === 'end') { recordHistory(UI.g, x.winner && humans.includes(x.winner) ? 'win' : 'loss'); toast((x.winner ? '⚔ Gana ' + MC_PVP.SIDE_ES[x.winner] + '. ' : '') + x.why, x.winner && humans.includes(x.winner) ? 'good' : 'bad', 10000);
+      if (NET.role === 'host') for (const gu of NET.guests) { const gg = pvpGameOfGuest(gu); netSendTo(gu, { t: 'over', win: !!gg && x.winner === gg.pvp.side, msg: (x.winner ? 'Gana ' + MC_PVP.SIDE_ES[x.winner] + '. ' : '') + x.why }); } }
+    render(); netScheduleSync();
   });
   setScreen('board');
   m.run().catch((e) => { console.error(e); toast('Error del motor: ' + e.message, 'bad'); });
 }
 let _rsoon = null;
 function renderSoon() { if (_rsoon) return; _rsoon = setTimeout(() => { _rsoon = null; render(); }, 120); }
-function pvpStatusPills(g) {
-  const M = UI.match; const r = M.result;
-  if (r) return h('span', { class: 'pill ' + (r.winner === g.pvp.side ? 'green' : r.winner ? 'red' : 'gold') }, r.winner ? (r.winner === g.pvp.side ? '¡VICTORIA DE ' : 'GANA ') + MC_PVP.SIDE_ES[r.winner].toUpperCase() + (r.winner === g.pvp.side ? '!' : '') : r.both ? 'AMBOS PIERDEN' : 'EMPATE');
-  if (g.over) return h('span', { class: 'pill gold' }, 'Tu mesa terminó: el rival juega su fase');
-  return h('span', { class: 'pill ' + (g.pvp.side === 'registration' ? 'blue' : 'red') }, '⚔ ' + MC_PVP.SIDE_ES[g.pvp.side]);
-}
-function renderPvpBar(g) {
-  const M = UI.match; const o = g.pvp.other(); const cur = M.current || {};
+// resumen de la partida competitiva para la mesa g (lo usa la barra y se envía a los invitados)
+function pvpSummary(g) {
+  const M = g.pvp.match; const o = g.pvp.other(); const cur = M.current || {};
   const v = o.villain(); const m = o.main();
   const rival = [
     v ? (o.name(v) + ' ' + Math.max(0, o.hpLeft(v)) + '/' + o.maxHp(v) + ' ❤') : 'sin líder',
     m ? (o.name(m) + ' ' + m.thr + '/' + (o.threshold(m) || '–') + ' ⚠') : '',
     o.players.map((p) => p.name + (p.alive ? ' ' + Math.max(0, o.hpLeft(o.idOf(p))) + '❤' : ' ✝')).join(' · '),
   ].filter(Boolean).join(' — ');
-  const lastLogs = (UI.rivalLog || []).slice(-4).map((x) => x.m);
-  return h('div', { class: 'pvpbar' },
-    h('span', { class: 'pill' }, 'Ronda ' + M.round + ' · ' + (cur.side ? (cur.kind === 'setup' ? 'Preparación' : cur.kind === 'player' ? 'Héroes' : 'Villano') + ' de ' + MC_PVP.SIDE_ES[cur.side] : '')),
-    h('span', { class: 'pvprival', title: 'Mesa del equipo rival (' + MC_PVP.SIDE_ES[o.pvp.side] + ')' }, '👁 Rival (' + MC_PVP.SIDE_ES[o.pvp.side] + '): ' + rival + (o.over ? ' — ' + (o.over.win ? 'ha derrotado a su líder' : 'ha caído') : '')),
-    M.result ? h('div', { class: 'pvpresult' }, h('b', {}, M.result.why), ' ', h('button', { class: 'btn small primary', onclick: () => { UI.g = null; UI.match = null; setScreen('new'); } }, 'Volver')) : null,
-    lastLogs.length && !o.pvpHuman ? h('div', { class: 'pvplog muted' }, lastLogs.join(' · ')) : null);
+  return { side: g.pvp.side, oppSide: o.pvp.side, round: M.round, cur: { side: cur.side, kind: cur.kind }, rival, rivalOver: o.over ? (o.over.win ? 'ha derrotado a su líder' : 'ha caído') : '',
+    result: M.result ? { winner: M.result.winner, why: M.result.why, both: !!M.result.both } : null, mineOver: !!g.over,
+    rivalLog: o.pvpCtrl === 'bot' ? (UI.rivalLog || []).slice(-4).map((x) => x.m) : [] };
 }
+const pvpSum = (g) => (g && g.pvp && g.pvp.match ? pvpSummary(g) : UI.pvpRemote || null);
+function pvpStatusPills(g) {
+  const S = pvpSum(g); if (!S) return null; const r = S.result;
+  if (r) return h('span', { class: 'pill ' + (r.winner === S.side ? 'green' : r.winner ? 'red' : 'gold') }, r.winner ? (r.winner === S.side ? '¡VICTORIA DE ' : 'GANA ') + MC_PVP.SIDE_ES[r.winner].toUpperCase() + (r.winner === S.side ? '!' : '') : r.both ? 'AMBOS PIERDEN' : 'EMPATE');
+  if (S.mineOver) return h('span', { class: 'pill gold' }, 'Tu mesa terminó: el rival juega su fase');
+  return h('span', { class: 'pill ' + (S.side === 'registration' ? 'blue' : 'red') }, '⚔ ' + MC_PVP.SIDE_ES[S.side]);
+}
+function renderPvpBar(g) {
+  const S = pvpSum(g); if (!S) return null; const cur = S.cur || {};
+  return h('div', { class: 'pvpbar' },
+    h('span', { class: 'pill' }, 'Ronda ' + S.round + ' · ' + (cur.side ? (cur.kind === 'setup' ? 'Preparación' : cur.kind === 'player' ? 'Héroes' : 'Villano') + ' de ' + MC_PVP.SIDE_ES[cur.side] : '')),
+    h('span', { class: 'pvprival', title: 'Mesa del equipo rival (' + MC_PVP.SIDE_ES[S.oppSide] + ')' }, '👁 Rival (' + MC_PVP.SIDE_ES[S.oppSide] + '): ' + S.rival + (S.rivalOver ? ' — ' + S.rivalOver : '')),
+    S.result ? h('div', { class: 'pvpresult' }, h('b', {}, S.result.why), ' ', h('button', { class: 'btn small primary', onclick: () => { UI.g = null; UI.match = null; UI.pvpRemote = null; setScreen(NET.role === 'guest' ? 'online' : 'new'); } }, 'Volver')) : null,
+    S.rivalLog && S.rivalLog.length ? h('div', { class: 'pvplog muted' }, S.rivalLog.join(' · ')) : null);
+}
+// ---- equipo jugado por invitados online (el anfitrión ejecuta su mesa sin mostrarla) ----
+const pvpGuestsOf = (g) => NET.guests.filter((gu) => g.cfg.players.some((pc) => pc.netGuest === gu.id));
+function pvpGameOfGuest(gu) { const M = UI.match; if (!M) return null; return ['registration', 'resistance'].map((s) => M.games[s]).find((g) => g.cfg.players.some((pc) => pc.netGuest === gu.id)) || null; }
+function pvpRemoteIO(side) {
+  let G = null;
+  const guestFor = (idx) => { const pc = G && idx != null && G.cfg.players[idx]; const gu = pc && pc.netGuest ? guestById(pc.netGuest) : null; return gu || pvpGuestsOf(G).find((x) => x.online) || pvpGuestsOf(G)[0] || null; };
+  const ask = (kind, q) => new Promise((res) => {
+    const gu = guestFor(q.player != null ? q.player : G.active);
+    if (!gu) { res(kind === 'ask' ? (q.options.find((o) => o.value !== null) || q.options[0] || {}).value : kind === 'cards' ? q.iids.slice(0, q.min || 0) : null); return; }
+    const id = ++NET.seq;
+    const map = (v) => (kind === 'ask' ? (v == null ? null : (q.options[v] ? q.options[v].value : null)) : v);
+    const pd = { id, gu, msg: { t: 'ask', id, kind, q: netSanitize(kind, q) }, answer: (v) => { if (!NET.pending.has(id)) return; NET.pending.delete(id); res(map(v)); }, local: async () => pd.answer(null) };
+    NET.pending.set(id, pd); netSyncNow(); netSendTo(gu, pd.msg);
+  });
+  const fx = (kind) => (q) => { if (G) for (const gu of pvpGuestsOf(G)) netSendTo(gu, { t: 'fx', id: ++NET.seq, kind, q: JSON.parse(JSON.stringify(q || {})), auto: true }); return Promise.resolve(); };
+  const io = {
+    bind: (g) => { G = g; },
+    log: () => netScheduleSync(), update: () => { netScheduleSync(); renderSoon(); },
+    ask: (q) => ask('ask', q), askCards: (q) => ask('cards', q), pay: (q) => ask('pay', q),
+    manual: () => Promise.resolve(),
+    noticeFx: fx('phase'), phaseFx: fx('phase'), stageFx: fx('stage'),
+    playerTurn: (p, g) => new Promise((res) => {
+      const gu = guestFor(p.idx);
+      if (!gu) { res(); return; }
+      NET.pvpTurns = NET.pvpTurns || {};
+      const T = { p, g, remote: gu.id, resolve: () => { delete NET.pvpTurns[gu.id]; netSendTo(gu, { t: 'turn', idx: null }); netScheduleSync(); renderSoon(); res(); } };
+      NET.pvpTurns[gu.id] = T;
+      for (const x of pvpGuestsOf(g)) netSendTo(x, { t: 'turn', idx: p.idx });
+      netScheduleSync(); renderSoon();
+    }),
+    gameOver: () => netScheduleSync(),
+  };
+  return io;
+}
+const netTurnFor = (gu) => (NET.pvpTurns && NET.pvpTurns[gu.id]) || (UI.turn && UI.turn.remote === gu.id ? UI.turn : null);
 function startGame({ st, stages }) {
   const ds = allDecks();
   const players = st.decks.map((id) => ds.find((d) => d.id === id)).filter(Boolean).map((d) => ({ heroSet: d.heroSet, deck: d.deck, aspects: d.aspects, deckName: d.name, netGuest: d.netGuest, netName: d.netName }));
@@ -18551,11 +18626,11 @@ function renderStatusBar(g, canAct, turnP) {
       !g.over && !UI.turn && NET.role !== 'guest' ? h('button', { class: 'btn small' + (g.pauseRequested ? ' on' : ''), title: 'Detiene el motor en la siguiente ventana para que uses herramientas manuales o juegues cartas a mano', onclick: () => { g.pauseRequested = !g.pauseRequested; render(); } }, g.pauseRequested ? '⏸ Pausa pedida' : '⏸ Pausar') : null,
       UI.turn && !UI.turn.remote ? undoBtn(g, canAct, 'btn') : null,
       UI.turn && !UI.turn.remote ? h('button', { class: 'btn primary', disabled: !canAct, onclick: async () => { if (canAct && await uiConfirm('¿Terminar el turno de ' + UI.turn.p.name + '?')) UI.turn.resolve(); } }, 'Fin de turno') : null,
-      UI.match ? pvpStatusPills(g) : g.over ? h('span', { class: 'pill ' + (g.over.win ? 'green' : 'red') }, g.over.win ? '¡VICTORIA!' : 'DERROTA') : null,
+      UI.match || UI.pvpRemote ? pvpStatusPills(g) : g.over ? h('span', { class: 'pill ' + (g.over.win ? 'green' : 'red') }, g.over.win ? '¡VICTORIA!' : 'DERROTA') : null,
       g.over && g.cfg.campaign ? h('button', { class: 'btn primary', onclick: () => { UI.g = null; setScreen('campaign'); } }, 'Volver a la campaña') : null,
       NET.role === 'guest' ? h('button', { class: 'btn small', onclick: async () => { if (await uiConfirm('¿Salir de la sala online?')) { netDisconnect(); UI.g = null; UI.stack = []; UI.turn = null; setScreen('online'); } } }, 'Salir') :
       h('button', { class: 'btn small', onclick: async () => { if (await uiConfirm('¿Abandonar la partida?')) { if (!UI.g.over && !UI.match) recordHistory(UI.g, 'abandon'); UI.g = null; UI.match = null; store.del('save'); setScreen('home'); } } }, 'Salir')),
-    UI.match ? renderPvpBar(g) : null);
+    UI.match || UI.pvpRemote ? renderPvpBar(g) : null);
 }
 function zoneRow(title, cards, opts = {}) {
   return h('div', { class: 'zone ' + (opts.cls || '') },
@@ -19312,7 +19387,7 @@ function renderDock(g) {
       parts.push(h('div', { class: 'dock' },
         sourceHeader(q),
         h('div', { class: 'dk-title' }, '🎯 ', linkTitle(q.title, q.cards), h('span', { class: 'pill' }, pr.sel.size + ' / ' + (q.min === q.max ? q.max : q.min + '–' + q.max))),
-        h('div', { class: 'dk-cards' }, q.iids.map((iid) => {
+        h('div', { class: 'dk-cards' }, q.iids.filter((iid) => g.C[iid]).map((iid) => {
           const c = g.C[iid];
           const el = h('div', { class: 'dkc' + (pr.sel.has(iid) ? ' on' : ''), onclick: (e) => onCardClick(e, iid) }, c.faceDown ? h('div', { class: 'cardback' + (c.owner == null && !c.drone ? ' enc' : '') }, c.drone ? 'DRON' : '') : cardThumb(c.code), h('div', { class: 'sname' }, g.name(c)));
           return el;
@@ -20005,6 +20080,8 @@ const TRANSPORT = {
 const guestById = (gid) => NET.guests.find((x) => x.id === gid);
 const netSend = (m) => { if (NET.conn && NET.conn.open) NET.conn.send(m); };
 function netBroadcast(m) { for (const gu of NET.guests) if (gu.online && gu.conn && gu.conn.open) gu.conn.send(m); }
+// en competitivo, solo a los invitados que juegan en la mesa g
+function netBroadcastFor(g, m) { if (!UI.match) return netBroadcast(m); for (const gu of NET.guests) if (pvpGameOfGuest(gu) === (g || UI.g)) netSendTo(gu, m); }
 function netSendTo(gu, m) { if (gu && gu.online && gu.conn && gu.conn.open) gu.conn.send(m); }
 function netDisconnect() {
   try { if (NET.transport) NET.transport.destroy(); } catch (e) { void e; }
@@ -20044,17 +20121,19 @@ function netOnHostMsg(c, m) {
   if (m.t === 'deck') { gu.deck = m.deck; render(); return; }
   if (m.t === 'reply') { const pd = NET.pending.get(m.id); if (pd && pd.gu.id === gu.id) pd.answer(m.value); return; }
   if (m.t === 'cont') { const pr = UI.stack.find((x) => x.netId === m.id); if (pr) pr.resolve(); return; }
-  if (m.t === 'end') { if (UI.turn && UI.turn.remote === gu.id && UI.g && !UI.g.busy && !UI.stack.length) UI.turn.resolve(); return; }
+  const T = netTurnFor(gu); const TG = T && T.g ? T.g : UI.g; const pvpRemote = !!(T && NET.pvpTurns && NET.pvpTurns[gu.id] === T);
+  const blocked = () => !TG || !T || TG.busy || TG.over || (!pvpRemote && UI.stack.length);
+  if (m.t === 'end') { if (!blocked()) T.resolve(); return; }
   if (m.t === 'undo') {
-    const g = UI.g;
-    if (!g || !UI.turn || UI.turn.remote !== gu.id || g.busy || UI.stack.length || g.over) return;
-    if (g.undo()) { UI.nodes.clear(); netSyncNow(); render(); }
+    const g = TG;
+    if (blocked()) return;
+    if (g.undo()) { if (!pvpRemote) UI.nodes.clear(); netSyncNow(); render(); }
     return;
   }
   if (m.t === 'act') {
-    const g = UI.g;
-    if (!g || !UI.turn || UI.turn.remote !== gu.id || g.busy || UI.stack.length || g.over) return;
-    const p = UI.turn.p; const ci = g.C[m.iid];
+    const g = TG;
+    if (blocked()) return;
+    const p = T.p; const ci = g.C[m.iid];
     if (!ci) return;
     const a = cardActions(g, ci, p, true).find((x) => x.label === m.label && !x.dis);
     if (a) g.act(a.fn); else netSendTo(gu, { t: 'toast', msg: 'Esa acción ya no está disponible.' });
@@ -20064,11 +20143,22 @@ let netSyncT = null;
 function netScheduleSync() { if (NET.role !== 'host' || !UI.g || netSyncT) return; netSyncT = setTimeout(() => { netSyncT = null; netSyncNow(); }, 200); }
 function netSyncNow() {
   if (NET.role !== 'host' || !UI.g || !NET.guests.some((x) => x.online)) return;
-  const g = UI.g;
-  const snap = g.snapshot(); snap.logs = snap.logs.slice(-80);
   const top = UI.stack[UI.stack.length - 1];
-  const wait = top ? (top.kind === 'wait' ? 'Esperando a ' + top.q.who + ': ' + top.q.title : top.kind === 'manual' ? 'El anfitrión resuelve a mano: ' + top.q.title : (top.q && top.q.title) || '') : '';
-  netBroadcast({ t: 'state', snap, over: g.over, vstep: g.vstep, busy: !!g.busy || UI.stack.length > 0, wait, turnIdx: UI.turn ? UI.turn.p.idx : null, undoN: g.undoStack ? g.undoStack.length : 0, effects: UI.effects.slice(-4).map((x) => ({ code: x.code, label: x.label, lines: x.lines.slice(-4) })) });
+  const cache = new Map();
+  for (const gu of NET.guests) {
+    if (!gu.online) continue;
+    const pg = UI.match ? pvpGameOfGuest(gu) : null;
+    const g = pg || UI.g;
+    if (!cache.has(g)) {
+      const snap = g.snapshot(); snap.logs = snap.logs.slice(-80);
+      const local = g === UI.g;
+      const wait = local && top ? (top.kind === 'wait' ? 'Esperando a ' + top.q.who + ': ' + top.q.title : top.kind === 'manual' ? 'El anfitrión resuelve a mano: ' + top.q.title : (top.q && top.q.title) || '') : (!local && UI.match && UI.match.current && UI.match.current.side !== (g.pvp && g.pvp.side) ? 'Juega el equipo rival…' : '');
+      const turn = local ? (UI.turn ? UI.turn.p.idx : null) : (Object.values(NET.pvpTurns || {}).find((t) => t.g === g) || {}).p;
+      cache.set(g, { t: 'state', snap, over: g.over, vstep: g.vstep, busy: !!g.busy || (local && UI.stack.length > 0), wait, turnIdx: turn == null ? null : (typeof turn === 'object' ? turn.idx : turn), undoN: g.undoStack ? g.undoStack.length : 0,
+        effects: local ? UI.effects.slice(-4).map((x) => ({ code: x.code, label: x.label, lines: x.lines.slice(-4) })) : [], pvp: g.pvp && g.pvp.match ? pvpSummary(g) : null });
+    }
+    netSendTo(gu, cache.get(g));
+  }
 }
 function netSanitize(kind, q) {
   const o = { title: q.title, text: q.text, optional: q.optional, window: q.window, cards: q.cards, player: q.player, min: q.min, max: q.max, iids: q.iids, source: q.source, req: q.req };
@@ -20118,8 +20208,8 @@ function netWindow(io, q, remoteFor) {
     netScheduleSync();
   });
 }
-function netWrapIO(io) {
-  const remoteFor = (idx) => { const g = UI.g; if (NET.role !== 'host' || !g || idx == null || !g.cfg.players[idx]) return null; const gid = g.cfg.players[idx].netGuest; return gid ? guestById(gid) : null; };
+function netWrapIO(io, gameOf) {
+  const remoteFor = (idx) => { const g = (gameOf && gameOf()) || UI.g; if (NET.role !== 'host' || !g || idx == null || !g.cfg.players[idx]) return null; const gid = g.cfg.players[idx].netGuest; return gid ? guestById(gid) : null; };
   const target = (q) => (q.player != null ? q.player : (UI.g ? UI.g.active : null));
   const w = { ...io };
   w.update = () => { io.update(); netScheduleSync(); };
@@ -20129,22 +20219,22 @@ function netWrapIO(io) {
   w.pay = (q) => { const gu = remoteFor(q.player != null ? q.player : target(q)); return gu ? netRemoteAsk(io, gu, 'pay', q) : io.pay(q); };
   w.playerTurn = (p, g) => {
     const gu = remoteFor(p.idx);
-    netBroadcast({ t: 'turn', idx: p.idx });
-    if (!gu) return io.playerTurn(p, g).then(() => { netBroadcast({ t: 'turn', idx: null }); });
-    return new Promise((res) => { UI.turn = { p, remote: gu.id, resolve: () => { UI.turn = null; netBroadcast({ t: 'turn', idx: null }); render(); netScheduleSync(); res(); } }; UI.focusP = p.idx; render(); netScheduleSync(); });
+    netBroadcastFor((gameOf && gameOf()) || UI.g, { t: 'turn', idx: p.idx });
+    if (!gu) return io.playerTurn(p, g).then(() => { netBroadcastFor((gameOf && gameOf()) || UI.g, { t: 'turn', idx: null }); });
+    return new Promise((res) => { UI.turn = { p, remote: gu.id, resolve: () => { UI.turn = null; netBroadcastFor((gameOf && gameOf()) || UI.g, { t: 'turn', idx: null }); render(); netScheduleSync(); res(); } }; UI.focusP = p.idx; render(); netScheduleSync(); });
   };
-  w.flash = (iid, kind) => { io.flash(iid, kind); netBroadcast({ t: 'flash', iid, kind }); };
+  w.flash = (iid, kind) => { io.flash(iid, kind); netBroadcastFor((gameOf && gameOf()) || UI.g, { t: 'flash', iid, kind }); };
   w.fdFlip = (q) => (remoteFor(q.player) ? Promise.resolve() : io.fdFlip(q));
-  w.gameOver = (o) => { io.gameOver(o); netSyncNow(); netBroadcast({ t: 'over', win: o.win, msg: o.msg }); };
+  w.gameOver = (o) => { io.gameOver(o); netSyncNow(); netBroadcastFor((gameOf && gameOf()) || UI.g, { t: 'over', win: o.win, msg: o.msg }); };
   return w;
 }
 const NET_FX = ['stage', 'threat', 'status', 'phase', 'announce', 'show', 'flip', 'boost'];
 function netOnPush(pr) {
   if (NET.role !== 'host' || !NET_FX.includes(pr.kind) || pr.netId) return;
   pr.netId = ++NET.seq;
-  netBroadcast({ t: 'fx', id: pr.netId, kind: pr.kind, q: JSON.parse(JSON.stringify(pr.q || {})), auto: !!pr.auto });
+  netBroadcastFor(UI.g, { t: 'fx', id: pr.netId, kind: pr.kind, q: JSON.parse(JSON.stringify(pr.q || {})), auto: !!pr.auto });
 }
-function netOnResolve(pr) { if (NET.role === 'host' && pr.netId) netBroadcast({ t: 'fxdone', id: pr.netId }); }
+function netOnResolve(pr) { if (NET.role === 'host' && pr.netId) netBroadcastFor(UI.g, { t: 'fxdone', id: pr.netId }); }
 function gameIO() { const io = makeIO(); return NET.role === 'host' ? netWrapIO(io) : io; }
 // --- invitado ---
 async function netJoin(code, deck) {
@@ -20174,6 +20264,7 @@ function netOnGuestMsg(m) {
     const g = MC.Game.fromSnapshot(m.snap, { update: () => render(), log: () => render() });
     g.over = m.over || null; g.vstep = m.vstep; g.busy = false;
     UI.g = g; NET.hostBusy = !!m.busy; NET.hostWait = m.wait || ''; UI.effects = (m.effects || []).map((x) => ({ ...x, lines: x.lines || [] }));
+    UI.pvpRemote = m.pvp || null;
     netGuestTurn(m.turnIdx);
     if (first) { UI.stack = UI.stack.filter((x) => x.netAsk); UI.nodes.clear(); setScreen('board'); toast('¡Empieza la partida!', 'good'); }
     render(); return;
