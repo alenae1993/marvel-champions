@@ -16214,14 +16214,77 @@ root.MC_PVP = { Match, SIDE_ES, on, other, leaderOf, leaderMain, enemyTeam, cros
 
 </script>
 <script>
-/* Rival automático (bot) para el modo competitivo: decide sin interfaz con reglas sencillas. */
+/* Rival automático (bot): decide sin interfaz.
+   Cada turno hace un plan: cuánta amenaza hay que quitar para no perder el plan principal antes de dos rondas,
+   qué cartas jugar (aliados y mejoras primero, eventos útiles después) y con qué cartas pagar (las de menos valor). */
 (function (root) {
 'use strict';
 const MC = root.MC;
-const rnd = (n) => Math.floor(Math.random() * n);
-const pick = (a) => a[rnd(a.length)];
+const TEXT = (d) => (d.textEn || '').replace(/<[^>]+>/g, '');
+// valor de una carta en la mano (cuanto más alto, menos apetece usarla para pagar)
+function cardValue(g, p, c) {
+  if (!c || !c.code) return 0;
+  const d = g.d(c);
+  if (d.type === 'resource') return 0.5;
+  let v = 2 + (d.cost || 0) * 0.6;
+  if (d.type === 'event') { const k = eventKind(g, c); v += k === 'attack' ? 3 : k === 'thwart' ? 2 : 0; }
+  if (d.type === 'ally') v += g.allies(p).length >= 3 ? -2 : 2;
+  if (d.type === 'upgrade' || d.type === 'support') v += 1.5;
+  if (d.fac === 'hero') v += 1;
+  if (d.unique && g.controlled(p).some((x) => g.d(x).nameEn === d.nameEn)) v -= 3; // copia única ya en juego
+  return v;
+}
+// ¿qué hace un evento? (para no jugarlo sin sentido)
+function eventKind(g, c) {
+  const d = g.d(c); const t = TEXT(d);
+  if (/\bAttack\b/.test(d.traitsEn || '') || /deal \d+ damage|attack/i.test(t)) return 'attack';
+  if (/\bThwart\b/.test(d.traitsEn || '') || /remove \d+ threat|thwart/i.test(t)) return 'thwart';
+  if (/\bDefense\b/.test(d.traitsEn || '')) return 'defense';
+  if (/draw \d+ card|search your deck|heal/i.test(t)) return 'utility';
+  return 'other';
+}
+function plan(g, p) {
+  const m = g.main();
+  const th = m ? g.threshold(m) || 99 : 99;
+  const T = m ? m.thr : 0;
+  const accel = m ? g.escalation(m) + g.accelIcons() + (g.accelTokens || 0) : 0;
+  const v = g.villain();
+  const vsch = v ? g.stat(v, 'sch') + 1 : 0;
+  const mins = g.minions();
+  const minSch = mins.reduce((s, x) => s + g.stat(x, 'sch'), 0);
+  // amenaza esperada en la próxima fase del villano
+  const next = accel + vsch * g.alive().length * 0.5 + minSch * 0.5;
+  const room = th - T;
+  const urgent = room <= next + 0.5;        // se completa en la próxima fase del villano
+  const soon = room <= next + 2.5;          // con poco margen
+  const crisis = g.sideSchemes().filter((s) => (s.thr || 0) > 0 && (g.d(s).crisis || g.kw(s, 'crisis') || (g.d(s).accel || 0) > 0 || g.dynIcon(s, 'accel')));
+  return { m, th, T, room, next, urgent, soon, crisis, myMinions: p ? g.minions(p) : [], v };
+}
+// elige la mejor carta de una lista según su naturaleza (enemigos, planes, cartas propias)
+function bestTarget(g, p, cards, title) {
+  const en = g.enemies();
+  if (cards.every((c) => en.includes(c))) {
+    const mins = cards.filter((c) => g.isMinion(c)).sort((a, b) => g.hpLeft(a) - g.hpLeft(b));
+    const engaged = mins.filter((c) => p && g.minions(p).includes(c));
+    if (/aturd|confun|stun|confus/i.test(title || '')) return cards.find((c) => !g.isMinion(c)) || mins[mins.length - 1] || cards[0];
+    return engaged[0] || mins[0] || cards[0];
+  }
+  const sch = g.schemes ? g.schemes() : [];
+  if (cards.every((c) => sch.includes(c))) {
+    const P = plan(g, p);
+    if (P.m && cards.includes(P.m) && (P.soon || P.T >= P.th * 0.5)) return P.m;
+    const cr = cards.find((c) => P.crisis.includes(c)); if (cr) return cr;
+    const side = cards.filter((c) => c !== P.m && (c.thr || 0) > 0).sort((a, b) => a.thr - b.thr);
+    if (side.length) return side[0];
+    return cards.includes(P.m) ? P.m : cards[0];
+  }
+  const fr = g.friendlyCharacters ? g.friendlyCharacters(null) : [];
+  if (cards.every((c) => fr.includes(c)) && /cura|heal/i.test(title || '')) return cards.slice().sort((a, b) => (b.dmg || 0) - (a.dmg || 0))[0];
+  return null;
+}
 function makeIO(opts = {}) {
   const logs = [];
+  const G = () => (opts.game ? opts.game() : null);
   const io = {
     bot: true,
     logs,
@@ -16230,94 +16293,151 @@ function makeIO(opts = {}) {
     async ask(q) {
       const o = q.options || [];
       const real = o.filter((x) => x.value !== null && x.value !== 'pause');
+      const g = G();
       if (/Quién defiende/.test(q.title || '')) {
-        const g = opts.game && opts.game();
         const hero = o.find((x) => x.value === 'hero');
-        const ally = o.find((x) => x.value && x.value !== 'hero' && x.value !== 'none');
         const none = o.find((x) => x.value === 'none');
-        // defender agota al héroe para su próximo turno: aliado primero; sin defensa si aguanta bien el golpe
-        if (ally) return ally.value;
-        if (g) { const p = g.players[q.player] || g.players[0]; const me = g.idOf(p); const atk = g.attackCtx && g.attackCtx.enemy ? g.stat(g.attackCtx.enemy, 'atk') + 2 : 4;
-          if (none && g.hpLeft(me) > atk + 4) return 'none';
-          if (hero) return 'hero'; }
+        const allies = o.filter((x) => x.value && x.value !== 'hero' && x.value !== 'none');
+        if (g) {
+          const p = g.players[q.player] || g.players[0]; const me = g.idOf(p);
+          const atk = g.attackCtx && g.attackCtx.enemy ? g.stat(g.attackCtx.enemy, 'atk') + 1.5 * (g.attackCtx.boostCards ? g.attackCtx.boostCards.length : 1) + (g.attackCtx.overkill ? 2 : 0) : 5;
+          if (allies.length) { const best = allies.map((x) => ({ x, c: g.C[x.value] })).filter((y) => y.c).sort((a, b) => (g.d(a.c).cost || 0) - (g.d(b.c).cost || 0))[0]; if (best) return best.x.value; }
+          if (none && g.hpLeft(me) > atk + 1) return 'none';
+          if (hero) return 'hero';
+        }
         return hero ? 'hero' : (none || o[0]).value;
       }
-      if (q.window) return Math.random() < 0.6 && real.length ? real[0].value : null; // respuestas: suele usarlas
-      // objetivos: enemigos y planes
-      const g2 = opts.game && opts.game();
-      if (g2 && real.length > 1 && real.every((x) => x.iid != null && g2.C[x.iid])) {
-        const cs = real.map((x) => ({ x, c: g2.C[x.iid] }));
-        const en = g2.enemies();
-        if (cs.every((o) => en.includes(o.c))) {
-          // remata esbirros heridos; si no, al villano
-          const mins = cs.filter((o) => g2.isMinion(o.c)).sort((a, b) => g2.hpLeft(a.c) - g2.hpLeft(b.c));
-          if (mins.length) return mins[0].x.value;
-          const v = cs.find((o) => !g2.isMinion(o.c)); if (v) return v.x.value;
-          return (mins[0] || cs[0]).x.value;
-        }
-        const sch = g2.schemes ? g2.schemes() : [];
-        if (cs.every((o) => sch.includes(o.c))) {
-          const m = g2.main();
-          const side = cs.filter((o) => o.c !== m && o.c.thr > 0).sort((a, b) => b.c.thr - a.c.thr);
-          if (m && cs.some((o) => o.c === m) && g2.threshold(m) && m.thr >= g2.threshold(m) * 0.5) return cs.find((o) => o.c === m).x.value;
-          return (side[0] || cs[0]).x.value;
-        }
+      if (q.window) {
+        // respuestas/interrupciones: úsalas salvo que cuesten vida o cartas, o si la vida está baja
+        if (g) { const p = g.players[q.player] || g.P(g.active) || g.players[0]; const me = p && g.idOf(p); if (me && g.hpLeft(me) <= 6) return null; }
+        const yes = real.find((x) => !/descart|pierde|sufre|responsabilidad/i.test(x.label || '')); return yes ? yes.value : null;
       }
       if (/mulligan/i.test(q.title || '')) return null;
       if (!real.length) return (o[0] || {}).value;
-      const yes = real.find((x) => x.value === true); if (yes && Math.random() < 0.7) return yes.value;
-      return pick(real).value;
+      // objetivos: enemigos y planes
+      if (g && real.length > 1 && real.every((x) => x.iid != null && g.C[x.iid])) {
+        const cs = real.map((x) => ({ x, c: g.C[x.iid] }));
+        const en = g.enemies();
+        if (cs.every((y) => en.includes(y.c))) {
+          const mins = cs.filter((y) => g.isMinion(y.c)).sort((a, b) => g.hpLeft(a.c) - g.hpLeft(b.c));
+          if (mins.length) return mins[0].x.value;
+          return cs[0].x.value;
+        }
+        const sch = g.schemes ? g.schemes() : [];
+        if (cs.every((y) => sch.includes(y.c))) {
+          const P = plan(g, g.players[q.player] || g.firstPlayer());
+          const main = cs.find((y) => y.c === P.m);
+          const cr = cs.find((y) => P.crisis.includes(y.c));
+          if (main && P.soon) return main.x.value;
+          if (cr) return cr.x.value;
+          const side = cs.filter((y) => y.c !== P.m && y.c.thr > 0).sort((a, b) => a.c.thr - b.c.thr);
+          if (side.length) return side[0].x.value;
+          return (main || cs[0]).x.value;
+        }
+        // cartas propias (p. ej. elegir un aliado o una mejora): la de menor coste
+        return cs.sort((a, b) => (g.d(a.c).cost || 0) - (g.d(b.c).cost || 0))[0].x.value;
+      }
+      const yes = real.find((x) => x.value === true); if (yes) return yes.value;
+      return real[0].value;
     },
     async askCards(q) {
-      if (/mulligan|descarta las cartas que quieras/i.test(q.title || '')) return [];
-      const ids = q.iids.slice().sort(() => Math.random() - 0.5);
+      const g = G();
+      if (/mulligan/i.test(q.title || '')) {
+        if (!g) return [];
+        const cs = q.iids.map((i) => g.C[i]).filter(Boolean);
+        return cs.filter((c) => (g.d(c).cost || 0) >= 5).map((c) => c.iid).slice(0, q.max);
+      }
+      if (/descarta las cartas que quieras/i.test(q.title || '')) {
+        if (!g) return [];
+        const p = g.players[q.player] || g.players[0];
+        const cs = q.iids.map((i) => g.C[i]).filter(Boolean);
+        return cs.filter((c) => cardValue(g, p, c) < 1.2 && g.d(c).type !== 'resource').map((c) => c.iid).slice(0, q.max);
+      }
+      const ids = q.iids.slice();
+      if (g) {
+        const p = g.players[q.player] || g.P(g.active) || g.firstPlayer();
+        const cs = ids.map((i) => g.C[i]).filter(Boolean);
+        if (q.max === 1 && cs.length) { const b = bestTarget(g, p, cs, q.title); if (b) return [b.iid]; }
+        ids.sort((a, b) => cardValue(g, p, g.C[a]) - cardValue(g, p, g.C[b]));
+      }
       return ids.slice(0, Math.max(q.min, Math.min(q.max, q.min || 1)));
     },
     async pay(q) {
       const sel = { cards: [], sources: [] };
       const tot = { mental: 0, energy: 0, physical: 0, wild: 0 };
       for (const s of q.sources) { if (q.satisfies(tot, q.req)) break; sel.sources.push(s.id); MC.addRes(tot, s.res); }
-      // paga primero con recursos y cartas caras que no se pueden jugar
-      const g = opts.game && opts.game();
-      const cards = q.cards.slice().sort((a, b) => {
-        const da = g ? g.d(g.C[a.iid] || {}) : {}, db = g ? g.d(g.C[b.iid] || {}) : {};
-        return (db.type === 'resource') - (da.type === 'resource') || (db.cost || 0) - (da.cost || 0);
-      });
+      const g = G();
+      const p = g ? (g.players[q.player] || g.P(g.active) || g.players[0]) : null;
+      const need = (q.req && q.req.types) || {};
+      const fits = (c) => Object.keys(need).some((k) => (c.res[k] || 0) + (c.res.wild || 0) > 0) ? 0 : 1;
+      const cards = q.cards.slice().sort((a, b) => fits(a) - fits(b) || (g ? cardValue(g, p, g.C[a.iid]) - cardValue(g, p, g.C[b.iid]) : 0));
       for (const c of cards) { if (q.satisfies(tot, q.req)) break; sel.cards.push(c.iid); MC.addRes(tot, c.res); }
       return q.satisfies(tot, q.req) ? sel : null;
     },
     async manual() {},
     async revealed() {},
     async playerTurn(p, g) {
-      const typeRank = { ally: 0, upgrade: 1, support: 1, event: 2 };
-      for (let k = 0; k < 14 && !g.over && p.alive; k++) {
+      const tried = new Set();
+      for (let k = 0; k < 18 && !g.over && p.alive; k++) {
         const me = g.idOf(p);
         const hero = g.isHeroForm(p);
-        if (hero && g.hpLeft(me) <= 3 && g.canFlip(p)) { await g.act(() => g.flip(p)); continue; }
-        if (!hero && g.hpLeft(me) <= Math.ceil(g.maxHp(me) / 2) && g.canBasic(p, 'recover')) { await g.act(() => g.basicRecover(p)); continue; }
-        if (!hero && g.canFlip(p) && g.hpLeft(me) > 5) { await g.act(() => g.flip(p)); continue; }
-        // cartas jugables (aliados y mejoras antes que eventos)
-        const hand = g.cards(g.pz(p, 'hand')).filter((c) => g.d(c).type !== 'resource' && g.playableNow(p, c).ok);
-        hand.sort((a, b) => (typeRank[g.d(a).type] ?? 3) - (typeRank[g.d(b).type] ?? 3) || (g.d(b).cost || 0) - (g.d(a).cost || 0));
-        if (hand.length && Math.random() < 0.85) { const before = g.z(g.pz(p, 'hand')).length; await g.act(() => g.playCard(p, hand[0])); if (g.z(g.pz(p, 'hand')).length !== before) continue; }
-        const m = g.main();
-        const thr = m && g.threshold(m) ? m.thr / g.threshold(m) : 0;
-        const danger = thr >= 0.4 || g.sideSchemes().some((x) => (x.thr || 0) > 0 && (g.d(x).crisis || g.kw(x, 'acceleration')));
-        const thwFirst = hero && g.stat(me, 'thw') > g.stat(me, 'atk') && m && m.thr > 0;
-        if ((danger || thwFirst) && g.canBasic(p, 'thwart')) { await g.act(() => g.basicThwart(p)); continue; }
+        const P = plan(g, p);
+        const hpFrac = g.hpLeft(me) / Math.max(1, g.maxHp(me));
+        // forma: Alter ego para curarse si está muy tocado y no hay prisa; Héroe si no
+        if (!hero) {
+          if (hpFrac < 0.75 && g.canBasic(p, 'recover')) { await g.act(() => g.basicRecover(p)); continue; }
+          if (g.canFlip(p) && (hpFrac >= 0.4 || P.urgent)) { await g.act(() => g.flip(p)); continue; }
+        }
+        // 1) amenaza urgente: desbaratar con todo
+        if (P.urgent || (P.crisis.length && !g.minions(p).length)) {
+          if (g.canBasic(p, 'thwart')) { await g.act(() => g.basicThwart(p)); continue; }
+          const ally = g.allies(p).find((a) => g.canAllyAct(p, a, 'thwart'));
+          if (ally) { await g.act(() => g.allyThwart(p, ally)); continue; }
+        }
+        // 2) cartas: aliados, mejoras y apoyos; eventos que tengan sentido
+        const hand = g.cards(g.pz(p, 'hand')).filter((c) => !tried.has(c.iid) && g.d(c).type !== 'resource' && g.playableNow(p, c).ok);
+        const want = hand.filter((c) => {
+          const d = g.d(c);
+          if (d.type === 'ally') return g.allies(p).length < 3;
+          if (d.type === 'upgrade' || d.type === 'support') return true;
+          if (d.type === 'event') {
+            const kd = eventKind(g, c);
+            if (kd === 'thwart') return (P.m && P.m.thr >= 2) || g.sideSchemes().some((x) => (x.thr || 0) > 0);
+            if (kd === 'attack') return g.enemies().length > 0;
+            if (kd === 'defense') return false;
+            return true;
+          }
+          return false;
+        });
+        const rank = (c) => { const d = g.d(c); if (d.type === 'event') { const kd = eventKind(g, c); return kd === 'thwart' && P.soon ? -1 : kd === 'attack' ? 0 : kd === 'thwart' ? 2 : 3; } return { ally: 1, upgrade: 2, support: 2.5 }[d.type] ?? 4; };
+        want.sort((a, b) => rank(a) - rank(b) || (g.d(b).cost || 0) - (g.d(a).cost || 0));
+        if (want.length) {
+          const c = want[0]; tried.add(c.iid);
+          await g.act(() => g.playCard(p, c));
+          continue;
+        }
+        // 3) acciones básicas: desbaratar si se acerca el plan, si no atacar
+        const thwFirst = P.soon || (hero && g.stat(me, 'thw') > g.stat(me, 'atk') && P.m && P.m.thr > 0);
+        if (thwFirst && g.canBasic(p, 'thwart')) { await g.act(() => g.basicThwart(p)); continue; }
         if (g.canBasic(p, 'attack')) { await g.act(() => g.basicAttack(p)); continue; }
         if (g.canBasic(p, 'thwart')) { await g.act(() => g.basicThwart(p)); continue; }
+        // 4) aliados: esbirros primero, amenaza si hace falta
         let did = false;
         for (const a of g.allies(p)) {
-          if (danger && g.canAllyAct(p, a, 'thwart')) { await g.act(() => g.allyThwart(p, a)); did = true; break; }
-          if (g.canAllyAct(p, a, 'attack')) { await g.act(() => g.allyAttack(p, a)); did = true; break; }
+          const lowHp = g.hpLeft(a) <= (g.d(a).atkCost || 0);
+          if (P.soon && g.canAllyAct(p, a, 'thwart')) { await g.act(() => g.allyThwart(p, a)); did = true; break; }
+          if (!lowHp && g.canAllyAct(p, a, 'attack')) { await g.act(() => g.allyAttack(p, a)); did = true; break; }
           if (g.canAllyAct(p, a, 'thwart')) { await g.act(() => g.allyThwart(p, a)); did = true; break; }
         }
         if (did) continue;
+        // 5) habilidades de cartas en juego
         const abs = [];
-        for (const c of g.controlled(p)) for (const ab of g.abilitiesOf(p, c)) if (!ab.manual && g.abilityUsable(p, c, ab)) abs.push(() => g.useAbility(p, c, ab));
-        if (abs.length && Math.random() < 0.7) { await g.act(pick(abs)); continue; }
-        if (g.canBasic(p, 'recover') && g.hpLeft(me) < g.maxHp(me)) { await g.act(() => g.basicRecover(p)); continue; }
+        for (const c of g.controlled(p)) for (const ab of g.abilitiesOf(p, c)) if (!ab.manual && !tried.has(c.iid + ':' + (ab.label || '')) && g.abilityUsable(p, c, ab)) abs.push({ c, ab });
+        if (abs.length) { const x = abs[0]; tried.add(x.c.iid + ':' + (x.ab.label || '')); await g.act(() => g.useAbility(p, x.c, x.ab)); continue; }
+        if (!hero && g.canBasic(p, 'recover') && hpFrac < 1) { await g.act(() => g.basicRecover(p)); continue; }
+        // al final del turno: si el héroe está tocado y el plan no aprieta, pasa a Alter ego para curarse el turno siguiente
+        const threatDmg = g.enemies().filter((e) => e === P.v || g.minions(p).includes(e)).reduce((t, e) => t + g.stat(e, 'atk') + 1, 0);
+        if (hero && ((hpFrac <= 0.5 && !g.minions(p).length) || g.hpLeft(me) <= threatDmg + 1) && !P.urgent && g.canFlip(p)) { await g.act(() => g.flip(p)); continue; }
         break;
       }
     },
@@ -16325,7 +16445,7 @@ function makeIO(opts = {}) {
   };
   return io;
 }
-root.MC_BOT = { makeIO };
+root.MC_BOT = { makeIO, plan, cardValue };
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
