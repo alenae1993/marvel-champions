@@ -1294,7 +1294,14 @@ class Game {
     if (ci.x && ci.x.enthralled && /\.eng$/.test(ci.zone || '')) return BLANK_FX;
     if (ci.zone && /\.id$/.test(ci.zone) && this.Z.attached && this.Z.attached.length && this.cards('attached').some((a) => a.host === ci.iid && (CARDS[a.code] || {}).fac === 'encounter' && this.FX.get(a.code, this).blankHost)) return BLANK_FX;
     if (this.blankTech && ci.owner != null && /\bTech\b/.test(CARDS[ci.code] && CARDS[ci.code].traitsEn || '') && CARDS[ci.code].fac !== 'encounter' && this.inPlay(ci)) return BLANK_FX;
+    if (ci.x && ci.x.blankR != null && ci.x.blankR === this.round && this.inPlay(ci)) return BLANK_FX;
     return this.FX.get(ci.code, this);
+  }
+  // ¿es la cara de una carta de identidad de doble cara que no es héroe/alter ego? (p. ej., SP//dr)
+  static identitySide(code) {
+    const d = CARDS[code]; if (!d || !/[ab]$/.test(code)) return false;
+    const o = CARDS[code.slice(0, -1) + (/a$/.test(code) ? 'b' : 'a')];
+    return !!o && ['hero', 'alter_ego'].includes(o.type) && !['hero', 'alter_ego'].includes(d.type);
   }
   hasLimit(key) { return !!this.limits[key]; }
   setLimit(key, until) { this.limits[key] = until || 'round'; }
@@ -1302,7 +1309,11 @@ class Game {
   // ---------- rasgos, palabras clave y características ----------
   traits(ci) {
     const d = this.d(ci);
-    const t = new Set(((d.traitsEn || '').match(/[^.]+/g) || []).map((s) => s.trim().toLowerCase()).filter(Boolean));
+    const t = new Set();
+    for (const raw of ((d.traitsEn || '').replace(/\b((?:[A-Z]\.){2,})/g, (m) => m.slice(0, -1).replace(/\./g, '\u00b7') + '.').match(/[^.]+/g) || [])) {
+      const x = raw.trim().toLowerCase(); if (!x) continue;
+      if (x.includes('\u00b7')) { t.add(x.replace(/\u00b7/g, '.') + '.'); t.add(x.replace(/\u00b7/g, '')); } else t.add(x);
+    }
     if (ci.drone) t.add('drone');
     for (const m of this.traitMods) if (m.iid === ci.iid) t.add(m.trait.toLowerCase());
     for (const src of this.allInPlay()) {
@@ -1514,7 +1525,7 @@ class Game {
       for (const [code, q] of Object.entries(pc.deck || {})) {
         const d = CARDS[code];
         if (!d || ['hero', 'alter_ego'].includes(d.type)) continue;
-        if (d.fac === 'encounter') continue;
+        if (d.fac === 'encounter' || Game.identitySide(code)) continue;
         for (let k = 0; k < q; k++) deck.push(this.mk(code, i, this.pz(p, 'deck')));
       }
       shuffle(this.z(this.pz(p, 'deck')));
@@ -1726,7 +1737,7 @@ class Game {
       await this.drawUpTo(p);
     }
     for (const p of this.order()) {
-      for (const c of this.controlled(p)) if (!this.attachments(c).some((a) => this.fx(a).noReady) && !(p.lockReady && c === this.idOf(p))) c.ex = false;
+      for (const c of this.controlled(p)) if (!this.attachments(c).some((a) => this.fx(a).noReady) && !(p.lockReady && c === this.idOf(p)) && !this.readyBlocked(c)) c.ex = false;
       for (const c of this.cards('attached').filter((a) => a.ctrl === p.idx)) c.ex = false;
     }
     await this.trigger('playerPhaseEnd', {});
@@ -1814,8 +1825,9 @@ class Game {
     if (f.escalation) return f.escalation(this, m);
     return this.scaled(this.d(m).esc || 0, this.d(m).escFixed);
   }
-  accelIcons() { return this.allInPlay().reduce((s, c) => s + (c.faceDown ? 0 : (this.d(c).accel || 0)), 0); }
-  hazardIcons() { return this.allInPlay().reduce((s, c) => s + (c.faceDown ? 0 : (this.d(c).hazard || 0)), 0); }
+  dynIcon(c, k) { const f = this.fx(c); if (!f.dynIcons) return 0; try { return (f.dynIcons(this, c) || {})[k] || 0; } catch (e) { return 0; } }
+  accelIcons() { return this.allInPlay().reduce((s, c) => s + (c.faceDown ? 0 : (this.d(c).accel || 0) + this.dynIcon(c, 'accel')), 0); }
+  hazardIcons() { return this.allInPlay().reduce((s, c) => s + (c.faceDown ? 0 : (this.d(c).hazard || 0) + this.dynIcon(c, 'hazard')), 0); }
   boostIcons(c) {
     let n = (this.d(c).boost || 0) + this.amplifyIcons();
     for (const x of this.allInPlay()) { const f = this.fx(x); if (f.extraBoostIcons && !x.faceDown) n += f.extraBoostIcons; }
@@ -1835,6 +1847,7 @@ class Game {
       this.log('El mazo de encuentros se agota: se baraja el descarte y se añade 1 ficha de aceleración.', 'warn');
       this.update();
       await this.notice('¡Se acabó el mazo de encuentros!', 'Se baraja el descarte y se coloca una ficha de Aceleración bajo el plan principal (ahora hay ' + this.accelTokens + ': +' + this.accelTokens + ' de amenaza en cada paso 1).', 'encout');
+      await this.trigger('accelTokenPlaced', {});
     }
     return this.top('enc.deck');
   }
@@ -1863,6 +1876,12 @@ class Game {
       }
       const c = this.top(this.pz(p, 'deck'));
       if (!c) break;
+      if (this.d(c).fac === 'encounter' && this.d(c).type !== 'obligation') {
+        c.faceDown = true; this.put(c, this.pz(p, 'fd'));
+        this.log(p.name + ' iba a robar una carta de encuentro de su mazo: se la reparte bocabajo y roba otra.', 'bad');
+        if (this.io.dealFx) await this.io.dealFx({ player: p.idx, iid: c.iid });
+        k--; continue;
+      }
       if (this.d(c).type === 'obligation' && !this.fx(c).stayInHand) {
         await this.enterPlay(c, p, this.pz(p, 'play'));
         this.log(p.name + ' roba la obligación ' + this.d(c).name + ': entra en juego (no se repone).', 'bad');
@@ -1877,9 +1896,10 @@ class Game {
     if (o.got && this.io.drawFx) await this.io.drawFx({ player: p.idx, iids: o.got });
     return drawn;
   }
+  readyBlocked(c) { return this.allInPlay().some((src) => { const f = this.fx(src); return f.blockReady && !src.faceDown && f.blockReady(this, src, c); }); }
   handSize(p) { return this.stat(this.idOf(p), 'hand'); }
   async drawUpTo(p) {
-    const n = this.handSize(p) - this.z(this.pz(p, 'hand')).length;
+    const n = this.handSize(p) - this.cards(this.pz(p, 'hand')).filter((c) => !this.fx(c).notHandSize).length;
     if (n > 0) await this.draw(p, n);
   }
   async discardTop(p, n) { // descarta n cartas del mazo del jugador; devuelve las cartas
@@ -1898,6 +1918,12 @@ class Game {
       }
       const c = this.top(this.pz(p, 'deck'));
       if (!c) break;
+      if (this.d(c).fac === 'encounter' && this.d(c).type !== 'obligation') {
+        c.faceDown = true; this.put(c, this.pz(p, 'fd'));
+        this.log(p.name + ' iba a descartar una carta de encuentro de su mazo: se la reparte bocabajo y roba 1 carta.', 'bad');
+        await this.draw(p, 1);
+        continue;
+      }
       this.put(c, this.pz(p, 'discard'));
       out.push(c);
     }
@@ -1954,6 +1980,11 @@ class Game {
     const v = this.villain();
     const coll = v && this.fx(v).collect;
     if (coll && this.inPlay(ci) && ci !== v && ci.zone !== 'main') { await this.toCollection(ci, { fromPlay: true }); return; }
+    if (ci.owner != null && this.inPlay(ci) && this.d(ci).fac !== 'encounter' && !this.isIdentity(ci) && this.allInPlay().some((c) => this.fx(c).on && this.fx(c).on.wouldDiscardPlayer)) {
+      const dc = { card: ci, player: this.ownerP(ci), toDeck: false };
+      await this.trigger('wouldDiscardPlayer', dc);
+      if (dc.toDeck && this.inPlay(ci)) { const o = this.P(ci.owner); await this.leavePlay(ci, this.pz(o, 'deck')); shuffle(this.z(this.pz(o, 'deck'))); this.log(this.name(ci) + ' se baraja en el mazo de ' + o.name + ' en lugar de descartarse.'); return; }
+    }
     const dest = this.discardDest(ci);
     await this.leavePlay(ci, dest);
     this.log(this.name(ci) + ' se descarta.');
@@ -2000,22 +2031,24 @@ class Game {
   }
   async toughen(ci) {
     if (!ci || !this.inPlay(ci)) return;
-    if (ci.tough >= 1) return;
-    ci.tough = 1;
+    if (ci.tough >= 1 && !this.fx(ci).multiTough) return false;
+    ci.tough = (ci.tough || 0) + 1;
     this.log(this.name(ci) + ' recibe un estado "Duro".');
     await this.statusFx(ci, 'tough', 'add');
     this.update();
+    return true;
   }
 
   // ---------- daño y curación ----------
   async damage(target, n, o = {}) {
     if (!target || !this.inPlay(target) || n <= 0) return 0;
+    if (target.x && target.x.noDmgR === this.round) { this.log(this.name(target) + ' no puede sufrir daño esta ronda.'); return 0; }
     const ctx = { target, n, prevented: false, ...o };
     await this.trigger('wouldTakeDamage', ctx);
     if (ctx.prevented || ctx.n <= 0 || !this.inPlay(target)) { this.update(); return 0; }
     if (target.tough > 0) {
       if (ctx.piercing) { target.tough = 0; this.log('Perforante: se descarta el estado "Duro" de ' + this.name(target) + '.'); await this.statusFx(target, 'tough', 'remove', 'Perforante: el estado Duro se descarta.'); }
-      else { target.tough = 0; this.log('El estado "Duro" de ' + this.name(target) + ' evita el daño.'); await this.statusFx(target, 'tough', 'remove', 'El estado Duro evita el daño (' + ctx.n + ').'); this.update(); return 0; }
+      else { target.tough--; this.log('El estado "Duro" de ' + this.name(target) + ' evita el daño.'); await this.statusFx(target, 'tough', 'remove', 'El estado Duro evita el daño (' + ctx.n + ').'); this.update(); return 0; }
     }
     const left = this.hpLeft(target);
     target.dmg += ctx.n;
@@ -2275,6 +2308,9 @@ class Game {
     for (const b of ctx.boostCards) {
       if (b.zone !== 'boost') continue;
       if (b.x.boostAfter && this.fx(b).afterBoost) { const f = this.fx(b); b.x.boostAfter = false; b.faceDown = false; await this.withSource(b, 'Tras la activación', () => f.afterBoost(this, b, ctx)); if (b.zone !== 'boost') continue; }
+      const bc = { card: b, attackCtx: ctx, player: ctx.player, dest: null, bottom: false };
+      if (ctx.enemy) await this.trigger('boostDiscarding', bc);
+      if (bc.dest && b.zone === 'boost') { await this.leavePlay(b, bc.dest); if (bc.bottom) { const a = this.z(bc.dest); a.unshift(a.pop()); } continue; }
       if (b.x.shuffleBack) { await this.leavePlay(b, 'enc.deck'); reshuffle = true; this.log(this.d(b).name + ' se baraja en el mazo de encuentros.'); }
       else await this.leavePlay(b, 'enc.discard');
     }
@@ -2309,8 +2345,8 @@ class Game {
     const opts = [];
     const heroForm = this.isHeroForm(p);
     const mustAlly = ctx.mustDefendWithAlly && this.allies(p).some((a) => !a.ex);
-    if (heroForm && !id.ex && !mustAlly && !this.cantDefend(p)) opts.push({ label: 'Defender con ' + this.name(id) + ' (DEF ' + this.stat(id, 'def') + ')', value: 'hero', iid: id.iid });
-    for (const a of this.allies(p)) if (!a.ex) opts.push({ label: 'Defender con ' + this.name(a) + ' (' + this.hpLeft(a) + ' vida)', value: a.iid, iid: a.iid });
+    if (heroForm && !id.ex && !mustAlly && !ctx.noDefend && !this.cantDefend(p)) opts.push({ label: 'Defender con ' + this.name(id) + ' (DEF ' + this.stat(id, 'def') + ')', value: 'hero', iid: id.iid });
+    for (const a of this.allies(p)) if (!a.ex && !ctx.noDefend) opts.push({ label: 'Defender con ' + this.name(a) + ' (' + this.hpLeft(a) + ' vida)', value: a.iid, iid: a.iid });
     if (!mustAlly) opts.push({ label: 'No defender (ataque sin defensa)', value: 'none' });
     const ch = ctx.forceHeroDefend ? 'hero' : await this.ask(p.name + ': ' + this.name(enemy) + ' ataca (ATQ ' + this.stat(enemy, 'atk') + (ctx.boostCards.length ? ' + ' + ctx.boostCards.length + ' carta(s) de potenciación' : '') + '). ¿Quién defiende?', opts, { always: true, player: p.idx });
     if (ctx.forceHeroDefend) {
@@ -2343,6 +2379,11 @@ class Game {
     if (dmg > 0 && target && !ctx.preventAllDamage && this.fx(enemy).indirectAttack) {
       this.log('El ataque de ' + this.name(enemy) + ' inflige ' + dmg + ' de daño indirecto.');
       await root.MC_FX.L.indirect(this, p, dmg); ctx.damageDealt = dmg; ctx.damaged = this.idOf(p);
+    } else if (dmg > 0 && target && !ctx.preventAllDamage && ctx.divide) {
+      const chars = this.friendlyCharacters(p).filter((c) => this.inPlay(c));
+      this.log('El daño de ' + this.name(enemy) + ' (' + dmg + ') se reparte entre los personajes de ' + p.name + '.');
+      const k = chars.length, base = Math.floor(dmg / k), rem = dmg % k;
+      for (let i = 0; i < k; i++) { const n = base + (i < rem ? 1 : 0); if (n > 0 && this.inPlay(chars[i])) { const dd = await this.damage(chars[i], n, { attack: true, attacker: enemy, source: 'ataque de ' + this.name(enemy), attackCtx: ctx }); ctx.damageDealt += dd; if (dd) ctx.damaged = chars[i]; } }
     } else if (dmg > 0 && target && !ctx.preventAllDamage) {
       const dctx = { attack: true, attacker: enemy, overkill: ctx.overkill, piercing: ctx.piercing, source: 'ataque de ' + this.name(enemy), attackCtx: ctx };
       ctx.damageDealt = await this.damage(target, dmg, dctx);
@@ -2487,6 +2528,7 @@ class Game {
     }
     this.update();
     this.checkOver();
+    if (p.alive) await this.trigger('afterRevealResolved', ctx);
     if (ctx.surge && p.alive) await this.trigger('surgeWould', ctx);
     if (ctx.surge && p.alive) {
       this.log('Oleada: se revela otra carta de encuentro.');
@@ -2713,6 +2755,8 @@ class Game {
       villainPhaseStart: 'Ventana: inicio de la fase del villano',
       playerPhaseEnd: 'Ventana: fin de la fase de jugador',
       roundEnd: 'Ventana: fin de la ronda',
+      wouldDiscardPlayer: 'Ventana: ' + (ctx.card ? this.d(ctx.card).name : '') + ' se va a descartar',
+      afterRevealResolved: 'Ventana: se ha resuelto ' + (ctx.card ? this.d(ctx.card).name : 'la carta de encuentro'),
     };
     return T[ev] || 'Ventana: ' + ev;
   }
@@ -2769,14 +2813,21 @@ class Game {
     if (f.onlyType) return { n: Math.max(0, c), types: { [f.onlyType]: Math.max(0, c) } };
     c -= p.nextCostReduction || 0;
     if (d.type === 'ally' && p.phaseFlags && p.phaseFlags.allyRed) c -= p.phaseFlags.allyRed;
+    if (f.req) { const rn = resTotal(f.req); return { n: Math.max(0, c, rn), types: { ...f.req } }; }
     return { n: Math.max(0, c) };
   }
   resourcesOf(p, ci, forCard) {
     // recursos que genera una carta de la mano
     const f = this.fx(ci);
-    const r = printedRes(this.d(ci));
-    if (f.resource) return f.resource(this, ci, p, forCard, r) || r;
-    return r;
+    let r = printedRes(this.d(ci));
+    if (f.resource) r = f.resource(this, ci, p, forCard, r) || r;
+    const id = this.idOf(p);
+    if (id && ci.zone === this.pz(p, 'hand') && this.attachments(id).some((a) => this.fx(a).handResAsEnergy)) { const t = resTotal(printedRes(this.d(ci))); if (t) r = { mental: 0, energy: t, physical: 0, wild: 0 }; }
+    return this.resFor(p, forCard, r);
+  }
+  resFor(p, forCard, r) {
+    const ff = forCard && forCard.code && this.fx(forCard);
+    return ff && ff.resFor ? ff.resFor(this, forCard, p, { ...r }) : r;
   }
   resourceSources(p, forCard) {
     // habilidades "Recurso" de cartas en juego
@@ -2789,7 +2840,7 @@ class Game {
         if (!this.controlled(p).includes(ci) && !a.anyPlayer) continue;
         if (!this.abilityUsable(p, ci, a)) continue;
         if (a.forCard && !(forCard && a.forCard(this, forCard))) continue;
-        out.push({ ci, a, res: a.gives ? a.gives(this, ci, p) : { wild: 1 } });
+        out.push({ ci, a, res: this.resFor(p, forCard, a.gives ? a.gives(this, ci, p) : { wild: 1 }) });
       }
     }
     return out;
@@ -2820,7 +2871,7 @@ class Game {
     return ok;
   }
   async pay(p, req, forCard, title) {
-    if (!req || ((req.n || 0) <= 0 && !req.types)) { if (forCard) forCard.x.paidWith = { mental: 0, energy: 0, physical: 0, wild: 0 }; return true; }
+    if (!req || ((req.n || 0) <= 0 && !req.types)) { if (forCard) { forCard.x.paidWith = { mental: 0, energy: 0, physical: 0, wild: 0 }; forCard.x.paidTags = {}; } return true; }
     const hand = this.cards(this.pz(p, 'hand')).filter((c) => !forCard || c.iid !== forCard.iid);
     const srcs = this.resourceSources(p, forCard);
     const sel = await this.io.pay({
@@ -2852,7 +2903,13 @@ class Game {
         await h.run(this, c, { card: c, player: p, forCard }, p);
       }
     }
-    if (forCard) forCard.x.paidWith = tot;
+    if (forCard) {
+      forCard.x.paidWith = tot;
+      const tags = {};
+      for (const s of usedSrc) if (s.a.tag) tags[s.a.tag] = (tags[s.a.tag] || 0) + resTotal(s.res);
+      forCard.x.paidTags = tags;
+    }
+    if (resTotal(tot) > 0) await this.trigger('resourcesGenerated', { player: p, n: resTotal(tot), forCard });
     if (cards.length || usedSrc.length) this.log(p.name + ' paga con ' + [...cards.map((c) => this.d(c).name), ...usedSrc.map((s) => this.d(s.ci).name)].join(', ') + '.');
     this.update();
     return true;
@@ -3183,6 +3240,8 @@ class Game {
   async flip(p, o = {}) {
     const id = this.idOf(p);
     let to = o.to;
+    const paired = p.heroes.length > 1 && p.heroes.length === p.aes.length;
+    if (!to && paired) { const i = Math.max(0, (id.side === 'hero' ? p.heroes : p.aes).indexOf(id.code)); to = (id.side === 'hero' ? p.aes : p.heroes)[i]; }
     if (!to && id.side === 'hero' && p.heroes.length > 1 && p.aes.length) {
       const opts = [{ label: CARDS[p.aes[0]].name + ' (Alter ego)', value: p.aes[0] }, ...p.heroes.filter((c) => c !== id.code).map((c) => ({ label: CARDS[c].name + ' (' + (CARDS[c].traits || 'otra forma de Héroe').replace(/\.$/, '') + ')', value: c }))];
       to = o.toHero ? opts[1].value : await this.ask('¿A qué forma cambias?', opts, { always: true, player: p.idx });
@@ -3211,6 +3270,16 @@ class Game {
     return false;
   }
   async allyAttack(p, a) {
+    if (!this.fx(a).selfIgnore) return this.allyAttack2(p, a);
+    const keep = [this.ignoreGuardNow]; this.ignoreGuardNow = true;
+    try { return await this.allyAttack2(p, a); } finally { this.ignoreGuardNow = keep[0]; }
+  }
+  async allyThwart(p, a) {
+    if (!this.fx(a).selfIgnore) return this.allyThwart2(p, a);
+    const keep = [this.ignorePatrolNow, this.ignoreCrisisNow]; this.ignorePatrolNow = true; this.ignoreCrisisNow = true;
+    try { return await this.allyThwart2(p, a); } finally { this.ignorePatrolNow = keep[0]; this.ignoreCrisisNow = keep[1]; }
+  }
+  async allyAttack2(p, a) {
     if (a.stun > 0) { a.ex = true; a.stun--; this.log(this.name(a) + ' está aturdido: se retira el aturdimiento.'); await this.statusFx(a, 'stun', 'remove'); this.update(); return; }
     const t = await this.chooseEnemy(p, this.name(a) + ' ataca: elige un enemigo (ATQ ' + this.stat(a, 'atk') + ')', { optional: true, villainOnly: !!this.fx(a).noMinionAttack });
     if (!t) return;
@@ -3225,7 +3294,7 @@ class Game {
     if (noC && (this.d(a).atkCost || extra)) this.log(this.name(a) + ' no sufre daño de consecuencia.');
     else if (this.inPlay(a) && (this.d(a).atkCost || extra)) { await this.damage(a, (this.d(a).atkCost || 0) + extra, { source: 'consecuencia' }); await this.trigger('afterConsequence', { ally: a, kind: 'attack', result: res, player: p }); }
   }
-  async allyThwart(p, a) {
+  async allyThwart2(p, a) {
     if (a.conf > 0) { a.ex = true; a.conf--; this.log(this.name(a) + ' está confundido: se retira la confusión.'); await this.statusFx(a, 'conf', 'remove'); this.update(); return; }
     const s = await this.chooseScheme(p, this.name(a) + ' desbarata: elige un plan (DES ' + this.stat(a, 'thw') + ')', { optional: true });
     if (!s) return;
@@ -8787,6 +8856,1139 @@ void ownerOf; void wmId; void valkP; void dgHost;
 
 </script>
 <script>
+/* Scripts a mano: ola de Motivos Siniestros — Nova, Ironheart, Spider-Ham y SP//dr (héroes, cartas de aspecto, archienemigos y módulos de sus packs). */
+(function (root) {
+'use strict';
+const FX = root.MC_FX;
+const L = FX.L;
+const MC = root.MC;
+const CARDS = MC.CARDS;
+const R = (c, def) => FX.register(c, def);
+const id = (g, p) => g.idOf(p);
+const hasT = (g, c, t) => g.hasTrait(c, t);
+const V = (g) => g.villain();
+const isHero = (g, p) => g.isHeroForm(p);
+const inPlayCode = (g, code) => g.allInPlay().find((c) => c.code === code && !c.faceDown) || null;
+const ctrlCode = (g, p, code) => g.controlled(p).find((c) => c.code === code) || null;
+const idTrait = (g, p, t) => hasT(g, id(g, p), t);
+const printed = (d, k) => d[{ mental: 'rM', energy: 'rE', physical: 'rP', wild: 'rW' }[k]] || 0;
+const resSum = (d) => (d.rM || 0) + (d.rE || 0) + (d.rP || 0) + (d.rW || 0);
+// ataque / intervención de un evento del héroe (estado ya resuelto por el motor)
+const atkEnemy = async (g, p, ci, n, o = {}) => { const t = o.target || await g.chooseEnemy(p, o.title || ('Inflige ' + n + ' de daño: elige un enemigo'), { minionOnly: o.minionOnly }); if (!t) return null; return g.attackEnemy(id(g, p), t, n + (ci ? g.eventBonus(ci, 'dmg') : 0), { player: p, card: ci, overkill: o.overkill, piercing: o.piercing }); };
+const thwEvent = async (g, p, ci, n, o = {}) => { const s = o.scheme || await g.chooseScheme(p, o.title || ('Retira ' + n + ' de amenaza: elige un plan'), { exclude: o.exclude }); if (!s) return null; return g.thwartScheme(id(g, p), s, n + (ci ? g.eventBonus(ci, 'thr') : 0), { player: p }); };
+const clearedBy = (g, r) => !!r && r.removed > 0 && (!g.inPlay(r.scheme) || r.scheme.thr <= 0);
+async function askNum(g, p, title, max, min) {
+  const opts = []; for (let x = min || 0; x <= max; x++) opts.push({ label: String(x), value: x + 1 });
+  const v = await g.ask(title, opts, { always: true, player: p.idx });
+  return Math.max(0, (v || 1) - 1);
+}
+async function fromDiscardToHand(g, p, pred, title) {
+  const list = g.cards(g.pz(p, 'discard')).filter((c) => pred(g.d(c), c));
+  if (!list.length) { g.log('No hay cartas válidas en el descarte de ' + p.name + '.'); return null; }
+  const c = await g.pickOne(title || 'Elige una carta de tu descarte', list, { player: p.idx });
+  if (c) { g.put(c, g.pz(p, 'hand')); g.log(g.d(c).name + ' vuelve a la mano de ' + p.name + '.'); g.update(); }
+  return c;
+}
+async function shuffleFromDiscard(g, p, pred, title, optional) {
+  const list = g.cards(g.pz(p, 'discard')).filter((c) => pred(g.d(c), c));
+  if (!list.length) { g.log('No hay cartas válidas en el descarte de ' + p.name + '.'); return null; }
+  const c = await g.pickOne(title || 'Elige una carta para barajar en tu mazo', list, { player: p.idx, optional });
+  if (c) { g.put(c, g.pz(p, 'deck')); MC.shuffle(g.z(g.pz(p, 'deck'))); g.log(g.d(c).name + ' se baraja en el mazo de ' + p.name + '.'); }
+  return c;
+}
+async function searchDeckDiscard(g, p, pred, title, to) {
+  const list = [...g.cards(g.pz(p, 'deck')), ...g.cards(g.pz(p, 'discard'))].filter((c) => pred(g.d(c), c));
+  const c = list.length ? await g.pickOne(title || 'Busca una carta', list, { player: p.idx }) : null;
+  if (c) { g.put(c, to || g.pz(p, 'hand')); g.log(p.name + ' busca ' + g.d(c).name + '.'); }
+  else g.log(p.name + ' no encuentra ninguna carta válida.');
+  MC.shuffle(g.z(g.pz(p, 'deck')));
+  return c;
+}
+async function obligation(g, ci, p, removeLabel, removeOk, removeRun, otherLabel, otherRun) {
+  if (isHero(g, p) && p.aes.length && await g.confirm(p.name + ': ¿cambiar a forma de Alter ego? (opcional)')) await g.flip(p, { free: true, to: p.aes[0] });
+  await L.chooseOne(g, p, g.d(ci).name, [
+    { label: removeLabel, ok: removeOk(), run: async () => { await removeRun(); await g.removeFromGame(ci); } },
+    { label: otherLabel, run: otherRun },
+  ]);
+}
+const ctxSurge = (ctx) => { if (ctx) ctx.surge = true; };
+const grantIf = (pred, kw) => (g, src, tgt) => (g.inPlay(src) && !src.faceDown && pred(g, src, tgt) ? kw : null);
+const statIf = (pred, map) => (g, src, tgt, s) => (g.inPlay(src) && !src.faceDown && map[s] && pred(g, src, tgt) ? map[s] : 0);
+// recursos impresos [energía] de las cartas que controla / tiene en la mano un jugador
+const energyCtrl = (g, p) => g.controlled(p).reduce((s, c) => s + (c.faceDown ? 0 : printed(g.d(c), 'energy')), 0);
+const energyHand = (g, p) => g.cards(g.pz(p, 'hand')).reduce((s, c) => s + (g.resourcesOf(p, c).energy || 0), 0);
+async function stealFromBoost(ctx, ci) { ctx.boostCards = ctx.boostCards.filter((b) => b !== ci); }
+
+// ===================== NOVA =====================
+const helmetOf = (g, p) => ctrlCode(g, p, '28009');
+const novaForce = (g, p) => p.novaR === g.round;
+async function novaRefresh(g, p) { const me = id(g, p); me.ex = false; g.log('Fuerza Nova: ' + g.name(me) + ' se prepara y roba 1 carta.', 'good'); await g.draw(p, 1); }
+R('28001a', { on: {
+  afterBasicPower: [{ cond: (g, ci, ctx, p) => ctx.player === p && isHero(g, p) && !!helmetOf(g, p) && helmetOf(g, p).ex && !g.readyBlocked(helmetOf(g, p)) && (ctx.kind !== 'recover'),
+    run: async (g, ci, ctx, p) => { const h = helmetOf(g, p); h.ex = false; g.log('Nova prepara el Casco Supernova.'); g.update(); } }],
+  afterHeroAttack: [{ cond: (g, ci, ctx, p) => novaForce(g, p) && ctx.attacker === id(g, p) && ctx.defeated, run: async (g, ci, ctx, p) => novaRefresh(g, p) }],
+  afterThwart: [{ cond: (g, ci, ctx, p) => novaForce(g, p) && ctx.thwarter === id(g, p) && ctx.removed > 0 && (!g.inPlay(ctx.scheme) || ctx.scheme.thr <= 0), run: async (g, ci, ctx, p) => novaRefresh(g, p) }],
+} });
+R('28001b', { abilities: [{ kind: 'action', label: 'Buscar el Casco Supernova (paga 1 recurso)', aeOnly: true,
+  cond: (g, ci, p) => g.canAfford(p, { n: 1 }) && [...g.cards(g.pz(p, 'deck')), ...g.cards(g.pz(p, 'discard'))].some((c) => c.code === '28009'),
+  run: async (g, ci, p) => {
+    const tmp = { code: ci.code, x: {} };
+    if (!(await g.pay(p, { n: 1 }, tmp, 'Sam Alexander: paga 1 recurso (con [comodín] el casco entra en juego)'))) return;
+    const wild = (tmp.x.paidWith || {}).wild > 0;
+    const c = [...g.cards(g.pz(p, 'deck')), ...g.cards(g.pz(p, 'discard'))].find((x) => x.code === '28009');
+    MC.shuffle(g.z(g.pz(p, 'deck')));
+    if (!c) return;
+    if (wild) { await g.enterPlay(c, p, g.pz(p, 'play')); g.log('Pagado con [comodín]: el Casco Supernova entra en juego.', 'good'); }
+    else { g.put(c, g.pz(p, 'hand')); g.log('El Casco Supernova pasa a la mano de ' + p.name + '.'); }
+    g.update();
+  } }] });
+R('28002', { on: { afterPlay: [{ optional: true, heroOnly: true, label: 'agotar y sufrir 1 daño → recuperar el evento',
+  cond: (g, ci, ctx, p) => ctx.player === p && !ci.ex && ctx.card !== ci && g.d(ctx.card).type === 'event' && ctx.card.zone === g.pz(p, 'discard'),
+  run: async (g, ci, ctx, p) => { ci.ex = true; const c = ctx.card; await g.damage(ci, 1, { source: 'Ms. Marvel' }); if (c.zone === g.pz(p, 'discard')) { g.put(c, g.pz(p, 'hand')); g.log(g.d(c).name + ' vuelve a la mano de ' + p.name + '.'); } } }] } });
+R('28003', { windowOnly: true, on: { wouldTakeDamage: [{ src: 'hand', optional: true, heroOnly: true, label: 'evitar 3 de daño',
+  cond: (g, ci, ctx) => ctx.attack && ctx.n > 0 && g.friendlyCharacters(null).includes(ctx.target),
+  run: async (g, ci, ctx, p) => {
+    ctx.n = Math.max(0, ctx.n - 3); g.log('Proyección de campo de fuerza evita 3 de daño.');
+    if (g.paidWith(ci, 'wild')) { const t = await g.chooseEnemy(p, 'Pagado con [comodín]: inflige 3 de daño a un enemigo', { ignoreGuard: true }); if (t) await g.damage(t, 3, { byPlayer: p, source: g.d(ci).name }); }
+  } }] } });
+const dblWild = (g, card, p, r) => ({ ...r, wild: (r.wild || 0) * 2 });
+R('28004', { heroOnly: true, thwartEvent: true, resFor: dblWild, play: async (g, ci, p) => thwEvent(g, p, ci, 3) });
+R('28005', { heroOnly: true, attackEvent: true, resFor: dblWild, play: async (g, ci, p) => atkEnemy(g, p, ci, 4) });
+R('28006', { heroOnly: true, canPlay: (g, ci, p) => !novaForce(g, p), play: async (g, ci, p) => { p.novaR = g.round; g.log('Hasta el final de la ronda, cada vez que Nova derrote a un enemigo o retire la última amenaza de un plan, se prepara y roba 1 carta.', 'good'); } });
+R('28007', { notHandSize: true });
+R('28008', { abilities: [{ kind: 'action', label: 'Barajar Conexión con la Mente Universal y robar 1', aeOnly: true, cost: { exhaust: true },
+  run: async (g, ci, p) => { const c = g.cards(g.pz(p, 'discard')).find((x) => x.code === '28007'); if (c) { g.put(c, g.pz(p, 'deck')); MC.shuffle(g.z(g.pz(p, 'deck'))); g.log('Conexión con la Mente Universal se baraja en el mazo.'); } await g.draw(p, 1); } }] });
+R('28009', { traits: (g, src, tgt) => { const p = g.ownerP(src); return g.inPlay(src) && p && tgt === id(g, p) && isHero(g, p) ? ['Aerial'] : null; },
+  abilities: [{ kind: 'resource', label: 'Casco Supernova', heroOnly: true, cost: { exhaust: true }, gives: () => ({ wild: 1 }) }] });
+R('28021', { toPlayArea: true, blockReady: (g, src, c) => c.code === '28009' && c.ctrl === src.ctrl,
+  abilities: [{ kind: 'action', label: 'Agotar a Sam Alexander → retirar la obligación', aeOnly: true, cost: { exhaustHero: true }, run: async (g, ci) => g.removeFromGame(ci) }] });
+R('28010', { canPlay: (g, ci, p) => idTrait(g, p, 'Champion'), enter: async (g, ci, p) => { if (isHero(g, p)) await fromDiscardToHand(g, p, (d) => d.type === 'event' && d.fac === 'aggression', 'La Langosta: elige un evento de Agresividad'); } });
+R('28013', { heroOnly: true, attackEvent: true, req: { physical: 1 }, play: async (g, ci, p) => {
+  const t = await g.chooseEnemy(p, 'Sin cuartel: inflige 4 de daño'); if (!t) return;
+  const before = g.hpLeft(t) + (t.tough ? 1e9 : 0);
+  const r = await atkEnemy(g, p, ci, 4, { target: t });
+  const ex = r && r.defeated ? Math.max(0, (r.dealt || 0) - before) : 0;
+  if (ex > 0) { const cs = await g.discardTop(p, ex); const got = cs.filter((c) => g.d(c).fac === 'aggression'); for (const c of got) g.put(c, g.pz(p, 'hand')); if (got.length) g.log(got.length + ' carta(s) de Agresividad van a la mano de ' + p.name + '.'); }
+} });
+R('28014', { heroOnly: true, attackEvent: true, play: async (g, ci, p) => {
+  const r = await atkEnemy(g, p, ci, 2);
+  if (r && r.defeated) { const t = await g.chooseEnemy(p, 'Uno a uno: inflige 2 de daño a un enemigo', { ignoreGuard: true }); if (t) await g.damage(t, 2, { byPlayer: p, source: g.d(ci).name }); }
+} });
+R('28016', { on: { afterPlay: [{ optional: true, heroOnly: true, label: '+1 ATQ hasta el final de la fase', cost: { exhaust: true },
+  cond: (g, ci, ctx, p) => ctx.player === p && g.d(ctx.card).type === 'event' && /\bAttack\b/.test(g.d(ctx.card).traitsEn || ''),
+  run: async (g, ci, ctx, p) => { g.addMod(id(g, p), 'atk', 1, 'phase'); g.log(g.name(id(g, p)) + ' recibe +1 ATQ hasta el final de la fase.'); } }] } });
+R('28017', { req: { mental: 2 }, on: { eventPlayInit: [{ cond: (g, ci, ctx, p) => ctx.player === p && g.d(ctx.card).fac === 'aggression' && /\bAttack\b/.test(g.d(ctx.card).traitsEn || '') && g.paidWith(ctx.card, 'mental') && (g.d(ctx.card).cost || 0) > 0,
+  run: async (g, ci, ctx) => { const n = g.d(ctx.card).cost || 0; ctx.card.x.bonus = ctx.card.x.bonus || { dmg: 0, thr: 0 }; ctx.card.x.bonus.dmg += n; g.log('Técnica depurada: +' + n + ' de daño para ' + g.d(ctx.card).name + '.'); } }] } });
+R('28018', { canPlay: (g, ci, p) => idTrait(g, p, 'Champion') || idTrait(g, p, 'Genius'), on: { afterPlay: [{ cond: (g, ci, ctx, p) => ctx.card === ci && ((ci.x.paidWith || {}).mental || 0) > 0, run: async (g, ci, ctx, p) => g.draw(p, ci.x.paidWith.mental) }] } });
+R('28019', { onSpent: async (g, c, p) => { if (idTrait(g, p, 'Civilian') && id(g, p).dmg > 0) await g.heal(id(g, p), 1); } });
+R('28020', { abilities: [{ kind: 'action', label: 'Un Campeón roba 2 y descarta 2', heroOnly: true, cost: { exhaust: true },
+  cond: (g) => g.alive().some((q) => idTrait(g, q, 'Champion')),
+  run: async (g, ci, p) => {
+    const qs = g.alive().filter((q) => idTrait(g, q, 'Champion'));
+    const q = qs.length === 1 ? qs[0] : g.P(await g.ask('Elige una identidad Campeón', qs.map((x) => ({ label: x.name, value: x.idx })), { always: true, player: p.idx }));
+    if (!q) return;
+    await g.draw(q, 2);
+    const h = g.cards(g.pz(q, 'hand'));
+    const sel = await g.askCards(q.name + ': descarta 2 cartas de tu mano', h, { min: Math.min(2, h.length), max: Math.min(2, h.length), player: q.idx });
+    for (const c of sel) g.put(c, g.pz(q, 'discard'));
+    if (sel.length) g.log(q.name + ' descarta ' + sel.map((c) => g.d(c).name).join(', ') + '.');
+  } }] });
+R('28026', { windowOnly: true, canPlay: (g, ci, p) => idTrait(g, p, 'Aerial'), on: { afterThwart: [{ src: 'hand', optional: true, heroOnly: true, label: 'retirar 3 de amenaza',
+  cond: (g, ci, ctx, p) => ctx.thwarter === id(g, p) && idTrait(g, p, 'Aerial'), run: async (g, ci, ctx, p) => thwEvent(g, p, ci, 3) }] } });
+R('28027', { on: {
+  wouldTakeDamage: [{ cond: (g, ci, ctx, p) => ctx.target === id(g, p) && ctx.attack && ctx.n > 0 && idTrait(g, p, 'Aerial'), run: async (g, ci, ctx) => { ctx.n -= 1; g.log('Ventaja de altura: −1 al daño del ataque.'); } }],
+  turnStart: [{ cond: (g, ci, ctx, p) => ctx.player === p, run: async (g, ci) => g.discard(ci) }],
+} });
+// archienemigo de Nova
+const wildInHand = (g, p) => g.cards(g.pz(p, 'hand')).filter((c) => (g.d(c).rW || 0) > 0).length;
+R('28023', { on: { enemyAttackInit: [{ cond: (g, ci, ctx) => ctx.enemy === ci && ctx.player, run: async (g, ci, ctx) => {
+  const n = wildInHand(g, ctx.player); if (n) { g.addMod(ci, 'atk', n, 'attack'); g.log('Belicista: +' + n + ' ATQ (cartas con [comodín] en la mano).'); }
+  ctx.overkill = true;
+} }] } });
+R('28024', { whenRevealed: async (g, ci, p) => {
+  if (g.canAfford(p, { n: 1, types: { wild: 1 } }) && await g.confirm(p.name + ': ¿gastas un recurso [comodín] para evitar los ataques?') && await g.pay(p, { n: 1, types: { wild: 1 } }, null, 'Paga 1 [comodín]')) return;
+  const v = V(g); if (v) await g.enemyAttack(v, p);
+  const w = inPlayCode(g, '28023'); if (w && p.alive) await g.enemyAttack(w, p);
+}, boost: async (g, ci, ctx) => { const p = ctx.player; if (!p) return; const n = wildInHand(g, p); if (n) await g.placeThreat(g.main(), n); } });
+R('28025', { whenRevealed: async (g, ci, p) => {
+  const all = [...g.cards(g.pz(p, 'hand')), ...g.controlled(p), ...g.cards(g.pz(p, 'discard'))];
+  const x = all.reduce((s, c) => s + (g.d(c).rW || 0), 0);
+  let k = 0;
+  for (; k < x; k++) { const c = await g.drawEncounterCard(); if (!c) break; g.put(c, 'enc.discard'); }
+  g.log('Se descartan ' + k + ' cartas del mazo de encuentros.');
+} });
+// Armadillo
+const armadillo = (g) => inPlayCode(g, '28029');
+R('28029', { multiTough: true, on: { afterEnemyActivation: [{ cond: (g, ci, ctx) => ctx.enemy === ci && g.inPlay(ci), run: async (g, ci) => g.toughen(ci) }] } });
+R('28030', { attachHost: async (g, ci, p) => {
+  let a = armadillo(g);
+  if (!a) { const c = await g.searchEncounter((d) => d.code === '28029'); if (c) { await g.engageMinion(c, p, { cancelWR: true }); a = c; } }
+  return a || null;
+}, on: { enemyAttackInit: [{ cond: (g, ci, ctx) => ctx.enemy && ctx.enemy.iid === ci.host && ctx.enemy.tough > 0, run: async (g, ci, ctx) => { ctx.noDefend = true; g.log('¡Rodando! Nadie puede defenderse de este ataque.'); } }] } });
+R('28031', {
+  whenRevealedAE: async (g, ci, p, ctx) => { const es = g.enemies().filter((e) => e.tough > 0); if (!es.length) return ctxSurge(ctx); for (const e of es) if (g.inPlay(e)) await g.enemyScheme(e, p); },
+  whenRevealedHero: async (g, ci, p, ctx) => { const es = g.enemies().filter((e) => e.tough > 0); if (!es.length) return ctxSurge(ctx); for (const e of es) if (g.inPlay(e) && p.alive) await g.enemyAttack(e, p); },
+});
+R('28032', { whenRevealed: async (g, ci, p, ctx) => { let n = 0; const a = armadillo(g); if (a && await g.toughen(a)) n++; if (V(g) && await g.toughen(V(g))) n++; if (n <= 1) ctxSurge(ctx); } });
+R('28028', { stat: (g, src, tgt, s) => (s === 'atk' && g.inPlay(src) && tgt.tough > 0 && g.d(tgt).fac === 'encounter' && (g.isMinion(tgt) || g.d(tgt).type === 'villain') ? 3 : 0) });
+
+// ===================== IRONHEART =====================
+const ver = (g, p) => ({ 29001: 1, 29002: 2, 29003: 3 })[id(g, p).code.slice(0, 5)] || 1;
+async function progress(g, p, n) { const me = id(g, p); me.ctr = (me.ctr || 0) + n; g.log(g.name(me) + ' recibe ' + n + ' contador(es) de progreso (' + me.ctr + ').', 'good'); g.update(); }
+async function levelUp(g, p, to, tough) {
+  const me = id(g, p); const from = me.code;
+  me.ctr -= 6; me.ex = false; me.code = to;
+  g.log('¡Subida de nivel! Ironheart pasa a ' + g.d(me).name + ' (versión ' + ver(g, p) + ').', 'good');
+  if (tough) await g.toughen(me);
+  g.update();
+  if (g.io.flipFx) await g.io.flipFx({ kind: 'identity', auto: true, from, to, title: 'Ironheart sube de nivel', sub: 'Versión ' + ver(g, p), player: p.idx });
+}
+R('29001a', { abilities: [{ kind: 'action', label: '¡Subir de nivel! (−6 progreso)', heroOnly: true, cond: (g, ci) => ci.ctr >= 6, run: async (g, ci, p) => levelUp(g, p, '29002a') }] });
+R('29002a', { abilities: [{ kind: 'action', label: '¡Subir de nivel! (−6 progreso)', heroOnly: true, cond: (g, ci) => ci.ctr >= 6, run: async (g, ci, p) => levelUp(g, p, '29003a', true) }] });
+R('29003a', { abilities: [{ kind: 'action', label: 'Máxima eficiencia: −1 progreso → 2 de daño', heroOnly: true, cond: (g, ci) => ci.ctr >= 1,
+  run: async (g, ci, p) => { const t = await g.chooseEnemy(p, 'Inflige 2 de daño a un enemigo', { ignoreGuard: true }); if (!t) return; ci.ctr--; await g.damage(t, 2, { byPlayer: p, source: 'Máxima eficiencia' }); } }] });
+const prodigy = (types, n, alt) => ({ setupText: null, abilities: [{ kind: 'action', label: 'Niña prodigio: +1 contador de progreso', aeOnly: true, limit: 'round',
+  cond: (g, ci, p) => g.canAfford(p, { n, types }) || (alt && g.canAfford(p, { n: alt })),
+  run: async (g, ci, p) => {
+    let ok;
+    if (alt && g.canAfford(p, { n, types }) && g.canAfford(p, { n: alt })) {
+      const v = await g.ask('¿Cómo pagas?', [{ label: 'Un recurso [mental]', value: 1 }, { label: '2 recursos de cualquier tipo', value: 2 }], { always: true, player: p.idx });
+      ok = v === 1 ? await g.pay(p, { n, types }, null, 'Paga 1 [mental]') : await g.pay(p, { n: alt }, null, 'Paga 2 recursos');
+    } else if (alt && !g.canAfford(p, { n, types })) ok = await g.pay(p, { n: alt }, null, 'Paga 2 recursos');
+    else ok = await g.pay(p, { n, types }, null, 'Paga el coste');
+    if (ok) await progress(g, p, 1);
+  } }] });
+R('29001b', prodigy({ mental: 1 }, 1));
+R('29002b', prodigy({ mental: 1 }, 1, 2));
+R('29003b', prodigy(undefined, 1));
+R('29004', { abilities: [{ kind: 'resource', label: 'Brawn (agotado)', limit: 'phase', cond: (g, ci) => ci.ex, gives: () => ({ mental: 1 }) }] });
+R('29005', { heroOnly: true, thwartEvent: true, play: async (g, ci, p) => { const r = await thwEvent(g, p, ci, 3); if (r) await progress(g, p, clearedBy(g, r) ? 2 : 1); } });
+R('29006', { heroOnly: true, attackEvent: true, play: async (g, ci, p) => { const r = await atkEnemy(g, p, ci, 4); if (r) await progress(g, p, r.defeated ? 2 : 1); } });
+R('29007', { heroOnly: true, play: async (g, ci, p) => {
+  const x = ver(g, p);
+  const opts = [
+    { label: 'Buscar una carta de Ironheart en tu mazo', value: 'search' },
+    { label: 'Dar a Ironheart un estado Duro', value: 'tough' },
+    { label: 'Preparar a Ironheart', value: 'ready' },
+  ];
+  const chosen = [];
+  for (let k = 0; k < x; k++) {
+    const left = opts.filter((o) => !chosen.includes(o.value));
+    const v = x >= 3 ? left[0].value : await g.ask('Nuevo y mejorado: elige una opción (' + (k + 1) + '/' + x + ')', left, { always: true, player: p.idx });
+    chosen.push(v);
+    if (v === 'search') await L.searchDeck(g, p, (d) => d.set === 'ironheart', 'Busca una carta de Ironheart');
+    if (v === 'tough') await g.toughen(id(g, p));
+    if (v === 'ready') { id(g, p).ex = false; g.log('Ironheart se prepara.'); }
+  }
+} });
+R('29008', { heroOnly: true, costMod: (g, ci, p) => -ver(g, p), play: async (g, ci, p) => {
+  const t = g.top('enc.deck');
+  p.scanR = g.round;
+  if (t) { await g.showCard(t.code, 'Escaneo sectorial: carta superior del mazo de encuentros', ['Hasta el final de la ronda puedes mirar la carta superior en cualquier momento.']); g.log(p.name + ' mira la carta superior del mazo de encuentros: ' + g.d(t).name + '.'); }
+} });
+R('29009', { onSpent: async (g, c, p) => { await progress(g, p, 1); await g.draw(p, 1); } });
+R('29010', { abilities: [{ kind: 'action', label: 'Ronnie Williams', aeOnly: true, cost: { exhaust: true }, run: async (g, ci, p) => L.chooseOne(g, p, 'Ronnie Williams', [
+  { label: 'Curar 2 de daño a Riri Williams', run: async () => g.heal(id(g, p), 2) },
+  { label: 'Poner 1 contador de progreso en Riri Williams', run: async () => progress(g, p, 1) },
+]) }] });
+R('29011', { abilities: [{ kind: 'action', label: 'Mirar 2: 1 a la mano, 1 al descarte', cost: { exhaust: true }, run: async (g, ci, p) => {
+  const top = g.cards(g.pz(p, 'deck')).slice(-2).reverse();
+  if (!top.length) return;
+  const keep = await g.pickOne('I.A. de Tony Stark: elige la carta que añades a tu mano', top, { player: p.idx, always: true });
+  for (const c of top) { if (c === keep) g.put(c, g.pz(p, 'hand')); else g.put(c, g.pz(p, 'discard')); }
+  g.log(p.name + ' añade ' + g.d(keep).name + ' a su mano y descarta la otra.');
+} }] });
+const plusHp = (g, src, tgt, s) => { const p = g.ownerP(src); return s === 'hp' && g.inPlay(src) && p && tgt === id(g, p) ? 2 : 0; };
+R('29012', { stat: plusHp, abilities: [{ kind: 'action', label: 'Daño igual a la versión', heroOnly: true, cost: { exhaust: true }, run: async (g, ci, p) => {
+  const t = await g.chooseEnemy(p, 'Inflige ' + ver(g, p) + ' de daño', { ignoreGuard: true }); if (t) await g.damage(t, ver(g, p), { byPlayer: p, source: 'Desintegradores fotónicos' }); } }] });
+R('29013', { stat: plusHp, abilities: [{ kind: 'action', label: 'Retirar amenaza igual a la versión', heroOnly: true, cost: { exhaust: true }, run: async (g, ci, p) => {
+  const s = await g.chooseScheme(p, 'Retira ' + ver(g, p) + ' de amenaza'); if (s) await g.removeThreat(s, ver(g, p)); } }] });
+R('29014', { abilities: [{ kind: 'action', label: 'Personajes Aéreos de un jugador: +1 DES', heroOnly: true, cost: { exhaust: true }, run: async (g, ci, p) => {
+  const q = await L.choosePlayer(g, p, 'Nube 9: elige un jugador');
+  const cs = g.friendlyCharacters(q).filter((c) => hasT(g, c, 'Aerial'));
+  for (const c of cs) g.addMod(c, 'thw', 1, 'phase');
+  g.log(cs.length ? cs.map((c) => g.name(c)).join(', ') + ' reciben +1 DES hasta el final de la fase.' : 'Ningún personaje Aéreo.');
+} }] });
+R('29016', { enter: async (g, ci, p) => {
+  if (!isHero(g, p)) return;
+  const list = g.friendlyCharacters(null).filter((c) => hasT(g, c, 'Champion'));
+  const c = await g.pickOne('Patriota: elige un personaje Campeón (+1 a sus atributos básicos esta ronda)', list, { player: p.idx, optional: true });
+  if (c) { for (const s of ['thw', 'atk', 'def']) g.addMod(c, s, 1, 'round'); g.log(g.name(c) + ' recibe +1 DES, +1 ATQ y +1 DEF hasta el final de la ronda.'); }
+} });
+const sumPowers = (g, p) => ['thw', 'atk', 'def'].reduce((s, k) => s + g.stat(id(g, p), k), 0);
+R('29017', { heroOnly: true, attackEvent: true, req: { energy: 1 }, canPlay: (g, ci, p) => !id(g, p).ex, play: async (g, ci, p) => { const n = sumPowers(g, p); id(g, p).ex = true; await atkEnemy(g, p, ci, n); } });
+R('29018', { heroOnly: true, thwartEvent: true, req: { mental: 1 }, canPlay: (g, ci, p) => !id(g, p).ex, play: async (g, ci, p) => { const n = sumPowers(g, p); id(g, p).ex = true; await thwEvent(g, p, ci, n); } });
+R('29020', { req: { mental: 2 }, uses: 3, abilities: [{ kind: 'action', label: '+1 DES y +1 ATQ a un personaje', heroOnly: true, cost: { exhaust: true, uses: 1 }, run: async (g, ci, p) => {
+  const c = await g.pickOne('Instalación de I+D: elige un personaje amigo', g.friendlyCharacters(null), { player: p.idx });
+  if (c) { g.addMod(c, 'thw', 1, 'phase'); g.addMod(c, 'atk', 1, 'phase'); g.log(g.name(c) + ' recibe +1 DES y +1 ATQ hasta el final de la fase.'); }
+} }] });
+R('29023', { enter: async (g, ci, p) => { const n = await askNum(g, p, 'Snowguard: ¿cuántos contadores de cambio pones? (0-3)', 3); ci.ctr = n; g.log('Snowguard entra con ' + n + ' contador(es) de cambio.'); },
+  stat: (g, src, tgt, s) => { if (tgt !== src || !g.inPlay(src)) return 0; const n = src.ctr; return (n === 1 && s === 'atk') ? 3 : (n === 2 && s === 'thw') ? 3 : (n === 3 && s === 'hp') ? 5 : 0; },
+  grantKw: (g, src, tgt) => (tgt === src && g.inPlay(src) ? (src.ctr === 1 ? { overkill: true } : src.ctr === 3 ? { retaliate: 1 } : null) : null),
+  traits: (g, src, tgt) => (tgt === src && g.inPlay(src) && src.ctr === 2 ? ['Aerial'] : null) });
+R('29024', { enter: async (g, ci, p) => {
+  if (!isHero(g, p)) return;
+  const list = g.allInPlay().filter((c) => !c.faceDown && ((g.d(c).type === 'attachment') || (g.isMinion(c) && !hasT(g, c, 'Elite')) || (g.d(c).type === 'side_scheme' && !g.kw(c, 'permanent'))));
+  const c = await g.pickOne('Vivian: elige un accesorio, esbirro no Élite o plan secundario no permanente (texto en blanco esta ronda)', list, { player: p.idx, optional: true });
+  if (c) { c.x.blankR = g.round; g.log('El texto de ' + g.name(c) + ' se considera en blanco hasta el final de la ronda.'); g.update(); }
+} });
+R('29025', { heroOnly: true, canPlay: (g, ci, p) => idTrait(g, p, 'Champion'), play: async (g, ci, p) => {
+  g.put(ci, 'removed');
+  const cs = g.allInPlay().filter((c) => !c.faceDown && (g.isIdentity(c) || g.d(c).type === 'ally') && hasT(g, c, 'Champion'));
+  for (const c of cs) c.x.noDmgR = g.round;
+  g.log('¡A por ellos, Campeones!: ' + (cs.map((c) => g.name(c)).join(', ') || 'nadie') + ' no puede(n) sufrir daño hasta el final de la ronda.', 'good');
+} });
+R('29027', { canPlay: (g, ci, p) => idTrait(g, p, 'Genius') && !ctrlCode(g, p, '29027'), abilities: [{ kind: 'resource', label: 'Ingenio', cost: { exhaust: true }, gives: () => ({ mental: 1 }) }] });
+R('29033', { canPlay: (g, ci, p) => idTrait(g, p, 'Champion'), on: { heroAttackInit: [{ cond: (g, ci, ctx) => ctx.attacker === ci && ctx.basic, run: async (g, ci, ctx, p) => {
+  const es = g.enemies().filter((e) => g.canBeDamaged(e));
+  if (es.length < 2) return;
+  const n = ctx.amount, k = es.length, base = Math.floor(n / k);
+  let rem = n % k;
+  const others = es.filter((e) => e !== ctx.target);
+  ctx.amount = base + (rem > 0 ? 1 : 0); if (rem > 0) rem--;
+  g.log('Bombshell reparte su daño (' + n + ') entre ' + k + ' enemigos.');
+  (ctx.after = ctx.after || []).push(async () => { for (const e of others) { const m = base + (rem > 0 ? 1 : 0); if (rem > 0) rem--; if (m > 0 && g.inPlay(e)) await g.damage(e, m, { attack: true, attacker: ci, byPlayer: p, source: 'ataque de Bombshell' }); } });
+} }] } });
+R('29034', { canPlay: (g, ci, p) => idTrait(g, p, 'Champion'), selfIgnore: true });
+R('29035', { canPlay: (g, ci, p) => idTrait(g, p, 'Champion'), on: { wouldDiscardPlayer: [{ optional: true, heroOnly: true, label: 'barajar la carta en el mazo de su dueño', cost: { exhaust: true },
+  cond: (g, ci, ctx) => !ctx.toDeck && ctx.card !== ci, run: async (g, ci, ctx) => { ctx.toDeck = true; } }] } });
+R('29015', { on: { afterHeroAttack: [{ optional: true, heroOnly: true, label: 'gastar [energía] → preparar a otro Campeón', cost: { types: { energy: 1 } }, cond: (g, ci, ctx, p) => ctx.attacker === ci && g.friendlyCharacters(p).some((c) => c !== ci && c.ex && hasT(g, c, 'Champion')),
+  run: async (g, ci, ctx, p) => { const c = await g.pickOne('Halcón: prepara a otro personaje Campeón', g.friendlyCharacters(p).filter((c) => c !== ci && c.ex && hasT(g, c, 'Champion')), { player: p.idx }); if (c) { c.ex = false; g.log(g.name(c) + ' se prepara.'); } } }],
+  afterThwart: [{ optional: true, heroOnly: true, label: 'gastar [energía] → preparar a otro Campeón', cost: { types: { energy: 1 } }, cond: (g, ci, ctx, p) => ctx.thwarter === ci && g.friendlyCharacters(p).some((c) => c !== ci && c.ex && hasT(g, c, 'Champion')),
+  run: async (g, ci, ctx, p) => { const c = await g.pickOne('Halcón: prepara a otro personaje Campeón', g.friendlyCharacters(p).filter((c) => c !== ci && c.ex && hasT(g, c, 'Champion')), { player: p.idx }); if (c) { c.ex = false; g.log(g.name(c) + ' se prepara.'); } } }] } });
+// obligación y archienemiga de Ironheart
+R('29028', { whenRevealed: async (g, ci, p) => {
+  const me = id(g, p);
+  if (me.ctr > 0) { me.ctr--; g.log(p.name + ' pierde 1 contador de progreso.'); return; }
+  g.log('Sin contadores de progreso: ' + p.name + ' recibe una carta de encuentro bocabajo y Un pequeño contratiempo se baraja en el mazo.', 'bad');
+  await g.dealEncounter(p, 1);
+  g.put(ci, 'enc.deck'); MC.shuffle(g.z('enc.deck'));
+} });
+const lucia = (g) => inPlayCode(g, '29030');
+R('29029', { dynIcons: (g) => (lucia(g) ? { hazard: 1 } : { accel: 1 }) });
+R('29030', { stat: (g, src, tgt, s) => (tgt === src && g.inPlay(src) && src.tough > 0 && (s === 'sch' || s === 'atk') ? 1 : 0),
+  on: { villainPhaseEnd: [{ cond: (g, ci) => g.inPlay(ci), run: async (g, ci) => g.toughen(ci) }] } });
+R('29032', { whenRevealed: async (g, ci, p, ctx) => {
+  const l = lucia(g), rf = inPlayCode(g, '29029');
+  if (l) await g.enemyScheme(l, p);
+  if (rf) await g.placeThreat(rf, 3);
+  if (!l && !rf) ctxSurge(ctx);
+} });
+R('29031', { attachHost: async (g, ci, p) => {
+  const ms = g.minions(); if (!ms.length) return 'surge';
+  const nt = (c) => g.traits(c).size; const mx = Math.max(...ms.map(nt));
+  const best = ms.filter((c) => nt(c) === mx);
+  return best.length === 1 ? best[0] : g.pickOne('Tecnología cíborg: elige el esbirro con más rasgos', best, { player: p.idx });
+}, stat: (g, src, tgt, s) => (s === 'hp' && g.inPlay(src) && tgt.iid === src.host ? 3 : 0), grantKw: (g, src, tgt) => (g.inPlay(src) && tgt.iid === src.host ? { retaliate: 1 } : null),
+boost: async (g, ci, ctx) => { const p = ctx.player; if (!p) return; await stealFromBoost(ctx, ci); g.resetCard(ci); ci.faceDown = true; g.put(ci, g.pz(p, 'fd')); g.log(g.d(ci).name + ' se reparte bocabajo a ' + p.name + '.', 'bad'); } });
+// Zzzax
+R('29036', { whenRevealed: async (g, ci) => { for (const q of g.order()) { const n = energyHand(g, q) + energyCtrl(g, q); if (n) await g.placeThreat(ci, n); } } });
+R('29037', { stat: (g, src, tgt, s) => { if (tgt !== src || !g.inPlay(src) || (s !== 'atk' && s !== 'hp')) return 0; const q = g.engagedWith(src); return q ? energyCtrl(g, q) : 0; },
+  boost: async (g, ci, ctx) => { const p = ctx.player; if (!p || energyHand(g, p) < 2) return; await stealFromBoost(ctx, ci); g.resetCard(ci); await g.engageMinion(ci, p, { cancelWR: true }); } });
+const energyOrIndirect = (label) => ({ kind: 'action', label: label || 'Descartar una carta con [energía] o sufrir 2 de daño indirecto → descartar esta carta', heroOnly: true,
+  run: async (g, ci, p) => {
+    const list = g.controlled(p).filter((c) => !g.isIdentity(c) && printed(g.d(c), 'energy') > 0 && !g.kw(c, 'permanent'));
+    await L.chooseOne(g, p, g.d(ci).name, [
+      { label: 'Descartar una carta que controlas con [energía] impresa', ok: list.length > 0, run: async () => { const c = await g.pickOne('Elige la carta a descartar', list, { player: p.idx }); if (c) await g.discard(c); } },
+      { label: 'Sufrir 2 de daño indirecto', run: async () => L.indirect(g, p, 2) },
+    ]);
+    await g.discard(ci);
+  } });
+R('29038', { attachHost: async (g, ci, p) => id(g, p), handResAsEnergy: true, abilities: [{ ...energyOrIndirect(), cond: (g, ci, p) => ci.host === id(g, p).iid }] });
+R('29039', { abilities: [energyOrIndirect()], on: { villainPhaseStart: [{ run: async (g) => { for (const q of g.order()) if (energyHand(g, q) + energyCtrl(g, q) > 0) await L.indirect(g, q, 2); } }] } });
+R('29040', { whenRevealed: async (g, ci, p, ctx) => { const me = id(g, p); const b = me.dmg; const n = energyHand(g, p); if (n) await L.indirect(g, p, n); if (!g.inPlay(me) || me.dmg - b <= 1) ctxSurge(ctx); } });
+
+// ===================== SPIDER-HAM =====================
+const toon = (g, p) => id(g, p).ctr || 0;
+async function addToon(g, p, n) { const me = id(g, p); me.ctr = (me.ctr || 0) + (n || 1); g.log(g.name(me) + ' recibe ' + (n || 1) + ' contador(es) de dibujo animado (' + me.ctr + ').'); g.update(); }
+const useToon = (g, p) => { const me = id(g, p); if ((me.ctr || 0) < 1) return false; me.ctr--; g.update(); return true; };
+const toonRes = []; for (let k = 1; k <= 10; k++) toonRes.push({ kind: 'resource', label: 'Contador de dibujo animado ' + k, heroOnly: true, cost: { uses: 1 }, cond: (g, ci) => (ci.ctr || 0) >= k, gives: () => ({ wild: 1 }) });
+R('30001a', { abilities: toonRes, on: { afterDamage: [{ cond: (g, ci, ctx, p) => ctx.target === ci && isHero(g, p) && ctx.dealt > 0, run: async (g, ci, ctx, p) => addToon(g, p, 1) }] } });
+R('30001b', { on: { afterBasicPower: [{ cond: (g, ci, ctx, p) => ctx.player === p && ctx.kind === 'recover', run: async (g, ci, ctx, p) => addToon(g, p, 1) }] } });
+R('30002', { enter: async (g, ci, p) => { g.log('¡Choca esos cinco! 🖐'); await addToon(g, p, 1); await shuffleFromDiscard(g, p, (d) => d.set === 'spiderham', 'Capitán Americato: baraja 1 carta de Spider-Ham de tu descarte en tu mazo'); } });
+R('30003', { heroOnly: true, thwartEvent: true, play: async (g, ci, p) => { const n = toon(g, p); if (n) await thwEvent(g, p, ci, n); else g.log('Spider-Ham no tiene contadores de dibujo animado.'); } });
+R('30004', { heroOnly: true, canPlay: (g, ci, p) => toon(g, p) >= 1, play: async (g, ci, p) => {
+  if (!useToon(g, p)) return;
+  g.log('«¡Lavado de cerdo!» (lee en voz alta el texto de ambientación)');
+  const ms = g.minions(), ss = g.sideSchemes().filter((s) => g.canRemoveThreat(s));
+  await L.chooseOne(g, p, 'Hogwashed', [
+    { label: 'Infligir 5 de daño a un esbirro', ok: ms.length > 0, run: async () => { const t = await g.pickOne('Elige un esbirro', ms, { player: p.idx }); if (t) await g.damage(t, 5, { byPlayer: p, source: g.d(ci).name }); } },
+    { label: 'Retirar 5 de amenaza de un plan secundario', ok: ss.length > 0, run: async () => { const s = await g.pickOne('Elige un plan secundario', ss, { player: p.idx }); if (s) await g.removeThreat(s, 5); } },
+  ]);
+} });
+R('30005', { windowOnly: true, on: { encounterRevealed: [{ src: 'hand', optional: true, heroOnly: true, label: '«¡No lo creo!»: anular la carta',
+  cond: (g, ci, ctx, p) => ctx.player === p && toon(g, p) >= 1 && !ctx.cancelled, run: async (g, ci, ctx, p) => { if (!useToon(g, p)) return; g.log('«¡No lo creo!» — se anulan los efectos de ' + g.d(ctx.card).name + '.', 'good'); ctx.cancelled = true; } }] } });
+R('30006', { heroOnly: true, play: async (g, ci, p) => { g.log(p.name + ' le saca la lengua al villano. 😛'); const v = V(g); if (v) await g.enemyAttack(v, p); if (p.alive) await g.draw(p, 3); } });
+R('30007', { heroOnly: true, attackEvent: true, play: async (g, ci, p) => { const r = await atkEnemy(g, p, ci, 6); if (r && r.target && g.inPlay(r.target)) await g.confuse(r.target); } });
+R('30008', { abilities: [{ kind: 'action', label: '+1 contador de dibujo animado', aeOnly: true, cost: { exhaust: true }, run: async (g, ci, p) => addToon(g, p, 1) }] });
+R('30009', { on: { wouldTakeDamage: [{ optional: true, label: 'descartar → evitar todo el daño salvo 1', cond: (g, ci, ctx, p) => ctx.target === id(g, p) && ctx.n > 1, run: async (g, ci, ctx) => { ctx.n = 1; g.log('¡Física de dibujos animados! (menea el cuerpo) Se evita todo el daño salvo 1.'); await g.discard(ci); } }] } });
+R('30010', { stat: (g, src, tgt, s) => { const p = g.ownerP(src); return s === 'atk' && g.inPlay(src) && p && tgt === id(g, p) ? 1 : 0; },
+  on: { basicPowerInit: [{ optional: true, heroOnly: true, label: '+2 ATQ y Exceso (−1 contador)', cost: { exhaust: true }, cond: (g, ci, ctx, p) => ctx.player === p && ctx.kind === 'attack' && ctx.char === id(g, p) && toon(g, p) >= 1,
+    run: async (g, ci, ctx, p) => { if (!useToon(g, p)) return; ctx.bonus += 2; ctx.overkill = true; g.log('Martillo de madera gigante: +2 ATQ y Exceso.'); } }] } });
+R('30011', { stat: (g, src, tgt, s) => { const p = g.ownerP(src); return s === 'thw' && g.inPlay(src) && p && tgt === id(g, p) ? 1 : 0; },
+  abilities: [{ kind: 'action', label: 'Preparar a Spider-Ham (−1 contador)', heroOnly: true, cost: { exhaust: true }, cond: (g, ci, p) => toon(g, p) >= 1, run: async (g, ci, p) => {
+    if (!useToon(g, p)) return; const me = id(g, p); me.ex = false; g.addTrait(me, 'Aerial', 'phase'); g.log('Spider-Ham se prepara y gana el rasgo Aéreo hasta el final de la fase.'); } }] });
+const ctrlWW = (g, p, not) => g.controlled(p).some((c) => c !== not && !c.faceDown && hasT(g, c, 'Web-Warrior'));
+R('30012', { on: { afterThwart: [{ optional: true, label: 'retirar la misma amenaza de otro plan', cond: (g, ci, ctx, p) => ctx.thwarter === ci && ctx.removed > 0 && ctrlWW(g, p, ci),
+  run: async (g, ci, ctx, p) => { const s = await g.chooseScheme(p, 'Lady Spider: retira ' + ctx.removed + ' de amenaza de otro plan', { exclude: [ctx.scheme] }); if (s) await g.removeThreat(s, ctx.removed); } }] } });
+R('30013', { enter: async (g, ci, p) => { const n = g.controlled(p).filter((c) => hasT(g, c, 'Web-Warrior')).length; for (let k = 0; k < n; k++) { const s = await g.chooseScheme(p, 'Spider-Man: retira 1 de amenaza (' + (k + 1) + '/' + n + ')', { optional: true }); if (!s) break; await g.removeThreat(s, 1); } } });
+R('30014', { heroOnly: true, thwartEvent: true, req: { energy: 1 }, play: async (g, ci, p) => {
+  let n = 0; const per = g.nPlayers();
+  for (const s of g.sideSchemes().slice()) { if (!g.inPlay(s) || !g.canRemoveThreat(s)) continue; const r = await g.thwartScheme(id(g, p), s, per, { player: p }); if (r && !g.inPlay(s)) n++; }
+  if (n && V(g)) await g.damage(V(g), n, { byPlayer: p, source: g.d(ci).name });
+} });
+R('30019', { attachTo: async (g, ci, p) => {
+  const list = g.schemes().filter((s) => !g.attachments(s).some((a) => a.code === '30019'));
+  return list.length ? g.pickOne('Vigilancia: elige un plan', list, { player: p.idx }) : null;
+}, on: { thwartInit: [{ cond: (g, ci, ctx) => ctx.scheme && ctx.scheme.iid === ci.host, run: async (g, ci, ctx, p) => {
+  const host = ctx.scheme;
+  g.later('afterThwart', async (c2) => {
+    if (!c2 || !(c2.removed > 0) || !isHero(g, p) || (ci.zone !== 'attached' && ci.zone !== g.pz(p, 'discard'))) return;
+    if (ci.zone === 'attached' && ci.host !== host.iid) return;
+    if (!(await g.confirm(p.name + ': ¿descartar Vigilancia para retirar ' + c2.removed + ' de amenaza de otro plan?'))) return;
+    if (ci.zone === 'attached') await g.discard(ci);
+    const s = await g.chooseScheme(p, 'Vigilancia: retira ' + c2.removed + ' de amenaza de otro plan', { exclude: [host] });
+    if (s) await g.removeThreat(s, c2.removed);
+  });
+} }] } });
+const TYPES = ['minion', 'treachery', 'attachment', 'side_scheme', 'environment', 'obligation'];
+R('30020', { canPlay: (g, ci, p) => ctrlWW(g, p), on: { encounterRevealed: [{ optional: true, label: 'nombrar un tipo de carta', cond: (g, ci, ctx, p) => ctx.player === p, run: async (g, ci, ctx, p) => {
+  const t = await g.ask('Spider-Man Escarlata: nombra un tipo de carta', TYPES.map((x) => ({ label: MC.TYPE_ES[x], value: x })), { always: true, player: p.idx });
+  if (g.d(ctx.card).type === t) { g.log('¡Acierto! Spider-Man Escarlata sufre 1 de daño y ' + p.name + ' roba 1 carta.', 'good'); await g.damage(ci, 1, { source: 'Spider-Man Escarlata' }); await g.draw(p, 1); }
+  else g.log('No acierta el tipo de carta.');
+} }] } });
+R('30021', { canPlay: (g, ci, p) => ctrlWW(g, p), on: { afterDamage: [{ cond: (g, ci, ctx) => ctx.target === ci && ctx.source === 'consecuencia', run: async (g, ci) => { ci.x.conseqExcess = g.hpLeft(ci) < 0; } }] },
+  whenDefeated: async (g, ci) => { if (ci.x.conseqExcess && ci.owner != null) { const p = g.P(ci.owner); await g.leavePlay(ci, g.pz(p, 'hand')); g.log('SP//dr vuelve a la mano de ' + p.name + '.'); } } });
+R('30029', { attachTo: async (g, ci, p) => {
+  const list = g.friendlyCharacters(null).filter((c) => /spider/i.test(g.d(c).nameEn || '') && !g.attachments(c).some((a) => a.code === '30029'));
+  return list.length ? g.pickOne('Guerrero de la Gran Red: elige un personaje con «Spider» en el nombre', list, { player: p.idx }) : false;
+}, traits: (g, src, tgt) => (g.inPlay(src) && tgt.iid === src.host ? ['Web-Warrior'] : null),
+on: { afterDefeated: [{ optional: true, label: '+1 ATQ hasta el final de la fase', cond: (g, ci, ctx) => ctx.type === 'ally' && hasT(g, ctx.card, 'Web-Warrior') && !!g.C[ci.host],
+  run: async (g, ci) => { const h = g.C[ci.host]; g.addMod(h, 'atk', 1, 'phase'); g.log(g.name(h) + ' recibe +1 ATQ hasta el final de la fase.'); } }] } });
+R('30024', { whenRevealed: async (g, ci, p, ctx) => obligation(g, ci, p, 'Agotar a Peter Porker y retirarle 1 contador → retirar la obligación de la partida',
+  () => !isHero(g, p) && !id(g, p).ex && toon(g, p) >= 1, async () => { id(g, p).ex = true; useToon(g, p); },
+  'Quedas aturdido (si ya lo estabas, Oleada) y se descarta la obligación', async () => { const me = id(g, p); if (me.stun > 0) ctxSurge(ctx); await g.stun(me); }) });
+// archienemigo de Spider-Ham
+const gobbler = (g) => inPlayCode(g, '30026');
+R('30025', { whenDefeated: async (g, ci, ctx) => {
+  const q = ctx.player || g.firstPlayer();
+  const gb = gobbler(g);
+  if (gb) { await g.enemyAttack(gb, q); return; }
+  const c = await g.searchEncounter((d) => d.code === '30026');
+  if (c) await g.engageMinion(c, q, { cancelWR: true });
+} });
+R('30026', { on: { minionEntered: [{ cond: (g, ci, ctx) => ctx.card === ci && ctx.player, run: async (g, ci, ctx) => { for (const c of g.controlled(ctx.player)) c.ctr = 0; g.log('El Duende Glotón: se descartan todos los contadores de las cartas de ' + ctx.player.name + '.', 'bad'); g.update(); } }] } });
+R('30027', { attachHost: async (g, ci, p) => gobbler(g) || (g.minions().length ? g.pickOne('Planeador Glotón: elige un esbirro', g.minions(), { player: p.idx }) : null),
+  traits: (g, src, tgt) => (g.inPlay(src) && tgt.iid === src.host ? ['Aerial'] : null) });
+R('30028', { whenRevealed: async (g, ci, p, ctx) => { const me = id(g, p); const was = me.conf > 0; await g.damage(me, 2, { source: g.d(ci).name }); await g.confuse(me); if (was) ctxSurge(ctx); } });
+// Herederos
+const isInh = (g, c) => g.isMinion(c) && hasT(g, c, 'Inheritor');
+const wwInPlay = (g) => g.friendlyCharacters(null).some((c) => hasT(g, c, 'Web-Warrior'));
+const inhGrant = (kw) => grantIf((g, src, tgt) => isInh(g, tgt), kw);
+R('30030', { on: { villainPhaseStart: [{ run: async (g) => {
+  for (let k = 0; k < 3; k++) {
+    const c = await g.drawEncounterCard(); if (!c) break;
+    const d = g.d(c);
+    if (d.type === 'minion' && /\bInheritor\b/.test(d.traitsEn || '')) {
+      const q = g.order().find((x) => g.friendlyCharacters(x).some((ch) => hasT(g, ch, 'Web-Warrior'))) || g.firstPlayer();
+      await g.engageMinion(c, q, { cancelWR: true });
+    } else { g.put(c, 'enc.discard'); g.log('Se descarta del mazo de encuentros: ' + d.name + '.'); }
+  }
+} }] } });
+R('30031', { dynIcons: (g) => ({ accel: g.minions().filter((c) => isInh(g, c)).length }), whenRevealed: async (g) => { if (wwInPlay(g)) for (const s of g.schemes()) await g.placeThreat(s, 1); } });
+R('30032', { grantKw: inhGrant({ patrol: true }), whenRevealed: async (g) => { if (wwInPlay(g)) await g.placeThreat(g.main(), 2); } });
+R('30033', { grantKw: inhGrant({ stalwart: true }), whenRevealed: async (g, ci, p) => { if (!wwInPlay(g)) return; const c = await g.pickOne('Daemos: aturde a un personaje que controlas', g.friendlyCharacters(p), { player: p.idx }); if (c) await g.stun(c); } });
+R('30034', { grantKw: inhGrant({ guard: true }), whenRevealed: async (g, ci) => { if (wwInPlay(g)) await g.toughen(ci); } });
+R('30035', { grantKw: inhGrant({ overkill: true, piercing: true }), whenRevealed: async (g, ci, p) => { if (wwInPlay(g)) await L.discardUpgradeOrSupport(g, p, ['upgrade', 'support'], 'Karn: descarta una mejora o apoyo que controles'); } });
+R('30036', { stat: statIf((g, src, tgt) => isInh(g, tgt), { atk: 1 }), whenRevealed: async (g, ci, p) => { if (wwInPlay(g)) await g.damage(id(g, p), 2, { source: 'Morlun' }); } });
+R('30037', { grantKw: inhGrant({ villainous: true }), whenRevealed: async (g, ci) => { if (wwInPlay(g)) { ci.x.fdBoost = (ci.x.fdBoost || 0) + 1; g.log('Solus recibe 1 carta de potenciación bocabajo.'); g.update(); } } });
+R('30038', { grantKw: inhGrant({ retaliate: 1 }), whenRevealed: async (g, ci, p) => { if (wwInPlay(g)) for (const c of g.friendlyCharacters(p).slice()) if (g.inPlay(c)) await g.damage(c, 1, { source: 'Verna' }); } });
+
+// ===================== SP//dr =====================
+const comp = (g, p) => g.C[p.spdrComp] && g.inPlay(g.C[p.spdrComp]) ? g.C[p.spdrComp] : null;
+const suitCard = (g, p) => (isHero(g, p) ? id(g, p) : comp(g, p));
+const interfaces = (g, p) => g.controlled(p).filter((c) => !g.isIdentity(c) && g.d(c).type === 'upgrade' && hasT(g, c, 'Interface')).sort((a, b) => a.iid - b.iid);
+const syncPaid = (ci) => ((ci.x.paidTags || {}).sync || 0);
+const syncRes = []; for (let k = 0; k < 8; k++) syncRes.push({ kind: 'resource', tag: 'sync', label: 'Ratio de sincronización ' + (k + 1), heroOnly: true,
+  cond: (g, ci, p) => { const u = interfaces(g, p)[k]; return !!u && !u.ex; },
+  gives: (g, ci, p) => { const u = interfaces(g, p)[k]; return u ? MC.printedRes(g.d(u)) : {}; },
+  run: async (g, ci, p) => { const u = interfaces(g, p)[k]; if (u) { u.ex = true; g.log('Ratio de sincronización: se agota ' + g.d(u).name + '.'); } } });
+const spdrFlip = { afterFlip: [{ cond: (g, ci, ctx, p) => ctx.player === p && !!comp(g, p), run: async (g, ci, ctx, p) => {
+  const c = comp(g, p), me = id(g, p);
+  [me.ex, c.ex] = [c.ex, me.ex];
+  c.code = ctx.toHero ? '31002b' : '31001b';
+  g.log(ctx.toHero ? 'El Traje SP//dr se activa y Peni Parker se conecta como piloto.' : 'El Traje SP//dr se desactiva y Peni Parker sale de la cabina.');
+  g.update();
+} }] };
+R('31001a', { abilities: syncRes, on: spdrFlip });
+R('31002a', { setupText: null, preSetup: async (g, ci, p) => {
+  if (comp(g, p)) return;
+  const c = g.mk('31001b', p.idx, g.pz(p, 'play'));
+  c.ctrl = p.idx; p.spdrComp = c.iid;
+  g.log('Compatibilidad psicogenética: el Traje SP//dr (lado Inactivo) entra en juego.');
+}, abilities: [{ kind: 'action', label: 'Mantenimiento: agotar el Traje SP//dr → robar 2', aeOnly: true, cond: (g, ci, p) => !!comp(g, p) && !comp(g, p).ex,
+  run: async (g, ci, p) => { comp(g, p).ex = true; await g.draw(p, 2); } }], on: spdrFlip });
+R(['31001b', '31002b'], { kw: { permanent: true } });
+R('31003', { stat: (g, src, tgt, s) => (tgt === src && g.inPlay(src) && (s === 'thw' || s === 'atk') ? src.ctr || 0 : 0),
+  enter: async (g, ci, p) => { const n = syncPaid(ci); if (n && isHero(g, p)) { ci.ctr = n; g.log('VEN#m recibe ' + n + ' contador(es) de simbionte.'); } } });
+R('31004', { heroOnly: true, play: async (g, ci, p) => L.chooseOne(g, p, '¡Todos los sistemas listos!', [
+  { label: 'Preparar cada mejora Interfaz que controlas', run: async () => { for (const u of interfaces(g, p)) u.ex = false; g.log('Se preparan las mejoras Interfaz.'); } },
+  { label: 'Buscar una mejora Interfaz en tu mazo y descarte', run: async () => searchDeckDiscard(g, p, (d) => d.type === 'upgrade' && /\bInterface\b/.test(d.traitsEn || ''), 'Busca una mejora Interfaz') },
+]) });
+R('31005', { heroOnly: true, thwartEvent: true, play: async (g, ci, p) => { await thwEvent(g, p, ci, 3); if (syncPaid(ci)) await thwEvent(g, p, null, 3, { title: 'Pagado con Ratio de sincronización: retira otros 3 de amenaza' }); } });
+R('31006', { heroOnly: true, attackEvent: true, play: async (g, ci, p) => { const r = await atkEnemy(g, p, ci, 5); if (r && syncPaid(ci) && g.inPlay(r.target)) await g.stun(r.target); } });
+R('31007', { abilities: [{ kind: 'action', label: 'Descartar 2 (3 en alter ego) → cartas de SP//dr a la mano', cost: { exhaust: true }, run: async (g, ci, p) => {
+  const cs = await g.discardTop(p, isHero(g, p) ? 2 : 3);
+  const got = cs.filter((c) => g.d(c).set === 'spdr');
+  for (const c of got) g.put(c, g.pz(p, 'hand'));
+  if (got.length) g.log(got.map((c) => g.d(c).name).join(', ') + ' va(n) a la mano de ' + p.name + '.');
+} }] });
+R('31008', { abilities: [{ kind: 'action', label: 'Protocolo de eyección', heroOnly: true, run: async (g, ci, p) => {
+  await g.discard(ci);
+  for (const u of interfaces(g, p)) u.ex = true;
+  const me = id(g, p); me.dmg = Math.max(0, g.maxHp(me) - 6);
+  await g.toughen(me);
+  g.log('Protocolo de eyección: la vida de ' + p.name + ' queda en 6.');
+  if (isHero(g, p)) await g.flip(p, { free: true, to: p.aes[0] });
+} }] });
+R('31009', { abilities: [
+  { kind: 'action', label: 'Agotar una mejora Interfaz → robar 1', heroOnly: true, cost: { exhaust: true }, cond: (g, ci, p) => interfaces(g, p).some((u) => !u.ex),
+    run: async (g, ci, p) => { const u = await g.pickOne('Agota una mejora Interfaz', interfaces(g, p).filter((u) => !u.ex), { player: p.idx }); if (u) { u.ex = true; await g.draw(p, 1); } } },
+  { kind: 'action', label: 'Descartar 1 carta → preparar una mejora Interfaz', heroOnly: true, cost: { exhaust: true, discardHand: 1 }, cond: (g, ci, p) => interfaces(g, p).some((u) => u.ex),
+    run: async (g, ci, p) => { const u = await g.pickOne('Prepara una mejora Interfaz', interfaces(g, p).filter((u) => u.ex), { player: p.idx }); if (u) { u.ex = false; g.log(g.d(u).name + ' se prepara.'); } } },
+] });
+R('31010', { abilities: [{ kind: 'action', label: 'Preparar el Traje SP//dr', heroOnly: true, cost: { exhaust: true }, cond: (g, ci, p) => !!suitCard(g, p) && suitCard(g, p).ex, run: async (g, ci, p) => { const s = suitCard(g, p); s.ex = false; g.log('El Traje SP//dr se prepara.'); } }] });
+const ifaceBoost = (kind, label) => ({ on: { basicPowerInit: [{ optional: true, heroOnly: true, label, cost: { exhaust: true }, cond: (g, ci, ctx, p) => ctx.player === p && ctx.kind === kind && ctx.char === id(g, p) && id(g, p).code === '31001a',
+  run: async (g, ci, ctx) => { ctx.bonus += 2; g.log(g.d(ci).name + ': +2.'); } }] } });
+R('31011', ifaceBoost('thwart', '+2 DES para esta intervención'));
+R('31012', ifaceBoost('defense', '+2 DEF para esta defensa'));
+R('31013', ifaceBoost('attack', '+2 ATQ para este ataque'));
+R('31014', { on: { afterEnemyAttack: [{ optional: true, label: 'mover 1 daño al atacante', cond: (g, ci, ctx) => ctx.defender === ci && g.inPlay(ci) && ci.dmg > 0 && g.inPlay(ctx.enemy),
+  run: async (g, ci, ctx, p) => { ci.dmg--; await g.damage(ctx.enemy, 1, { byPlayer: p, source: 'Daredevil' }); } }] } });
+R('31015', { stat: (g, src, tgt, s) => (tgt === src && s === 'atk' && g.inPlay(src) ? g.attachments(src).filter((a) => a.faceDown).length : 0),
+  on: { afterRevealResolved: [{ optional: true, label: 'vincular la traición bocabajo', cond: (g, ci, ctx, p) => ctx.player === p && g.d(ctx.card).type === 'treachery' && ctx.card.zone === 'enc.discard' && ctrlWW(g, p, ci) && g.attachments(ci).filter((a) => a.faceDown).length < 3,
+    run: async (g, ci, ctx, p) => { const t = ctx.card; g.put(t, 'attached'); t.host = ci.iid; t.faceDown = true; t.ctrl = null; g.log(g.d(t).name + ' se vincula bocabajo a Spider-Man Noir.'); g.update(); } }] } });
+R('31016', { heroOnly: true, canPlay: (g, ci, p) => g.controlled(p).some((c) => g.d(c).type === 'upgrade' && hasT(g, c, 'Tech') && !g.kw(c, 'permanent')), play: async (g, ci, p) => {
+  const u = await g.pickOne('Reutilizar: descarta una mejora Tecnología', g.controlled(p).filter((c) => g.d(c).type === 'upgrade' && hasT(g, c, 'Tech') && !g.kw(c, 'permanent')), { player: p.idx });
+  if (!u) return; const x = g.d(u).cost || 0; await g.discard(u);
+  const me = id(g, p); me.ex = false;
+  const s = await g.ask('Elige el atributo que recibe +' + x, [{ label: 'DES', value: 'thw' }, { label: 'ATQ', value: 'atk' }, { label: 'DEF', value: 'def' }], { always: true, player: p.idx });
+  g.addMod(me, s, x, 'round'); g.log(g.name(me) + ' se prepara y recibe +' + x + ' hasta el final de la ronda.');
+} });
+R('31017', { heroOnly: true, canPlay: (g, ci, p) => g.friendlyCharacters(p).some((c) => hasT(g, c, 'Web-Warrior')), play: async (g, ci, p) => {
+  const w = await g.pickOne('Inflige 1 de daño a un personaje Guerrero Arácnido que controlas', g.friendlyCharacters(p).filter((c) => hasT(g, c, 'Web-Warrior')), { player: p.idx });
+  if (!w) return; await g.damage(w, 1, { source: g.d(ci).name });
+  const es = await g.askCards('Elige hasta 2 enemigos para aturdir', g.enemies(), { min: 1, max: 2, player: p.idx });
+  if (es.length === 1) { await g.stun(es[0]); if (g.kw(es[0], 'steady')) await g.stun(es[0]); } else for (const e of es) await g.stun(e);
+} });
+R('31019', { uses: 6, on: { wouldTakeDamage: [{ cond: (g, ci, ctx, p) => ctx.target === id(g, p) && ctx.n > 0 && ci.ctr > 0, run: async (g, ci, ctx) => {
+  const k = Math.min(ci.ctr, ctx.n); ci.ctr -= k; ctx.n -= k; g.log('Generador de campo de fuerza: evita ' + k + ' de daño (' + ci.ctr + ' contadores).');
+  await g.checkUses(ci);
+} }] } });
+R('31020', { on: { encounterRevealed: [{ optional: true, label: '1 daño a un Guerrero Arácnido → anular la traición', cond: (g, ci, ctx, p) => ctx.player === p && g.friendlyCharacters(p).some((c) => hasT(g, c, 'Web-Warrior')),
+  run: async (g, ci, ctx, p) => {
+    const w = await g.pickOne('Inflige 1 de daño a un Guerrero Arácnido que controlas', g.friendlyCharacters(p).filter((c) => hasT(g, c, 'Web-Warrior')), { player: p.idx });
+    if (w) await g.damage(w, 1, { source: 'Sentido arácnido' });
+    if (g.d(ctx.card).type === 'treachery') { ctx.cancelWhenRevealed = true; g.log('Se anula el efecto «Cuando se muestre» de ' + g.d(ctx.card).name + '.', 'good'); await g.discard(ci); }
+  } }] } });
+const hamAfter = async (g, ci) => { const c = await g.drawEncounterCard(); if (!c) return; g.put(c, 'enc.discard'); const n = g.d(c).boost || 0; g.log('Spider-Ham descarta ' + g.d(c).name + ' (' + n + ' icono(s) de potenciación).'); if (n && g.inPlay(ci)) await g.damage(ci, n, { source: 'Spider-Ham' }); };
+R('31021', { canPlay: (g, ci, p) => ctrlWW(g, p), on: { afterHeroAttack: [{ cond: (g, ci, ctx) => ctx.attacker === ci, run: async (g, ci) => hamAfter(g, ci) }], afterThwart: [{ cond: (g, ci, ctx) => ctx.thwarter === ci, run: async (g, ci) => hamAfter(g, ci) }] } });
+R('31022', { canPlay: (g, ci, p) => ctrlWW(g, p), on: { afterPlay: [{ cond: (g, ci, ctx, p) => ctx.card === ci && g.controlled(p).some((c) => g.d(c).type === 'upgrade' && c.ex), run: async (g, ci, ctx, p) => {
+  const u = await g.pickOne('Spider-Man: prepara una mejora que controles', g.controlled(p).filter((c) => g.d(c).type === 'upgrade' && c.ex), { player: p.idx, optional: true });
+  if (!u) return; u.ex = false; g.log(g.d(u).name + ' se prepara.');
+  if (hasT(g, u, 'Tech')) await g.draw(p, 1);
+} }] } });
+const hp14 = (g, ci, p) => (g.d(id(g, p)).hp || 0) >= 14;
+R('31023', { heroOnly: true, canPlay: hp14, play: async (g, ci, p) => { id(g, p).ex = false; g.log(g.name(id(g, p)) + ' se prepara.'); } });
+R('31024', { canPlay: hp14, grantKw: (g, src, tgt) => { const p = g.ownerP(src); return g.inPlay(src) && p && tgt === id(g, p) ? { steady: true } : null; } });
+R('31029', { attachTo: async (g, ci, p) => {
+  const list = g.friendlyCharacters(null).filter((c) => !g.attachments(c).some((a) => a.code === '31029'));
+  return list.length ? g.pickOne('Claridad de propósito: elige un personaje amigo', list, { player: p.idx }) : false;
+}, abilities: [{ kind: 'resource', label: 'Claridad de propósito (1 daño al personaje)', heroOnly: true, cost: { exhaust: true }, cond: (g, ci) => !!g.C[ci.host] && g.inPlay(g.C[ci.host]), gives: () => ({ wild: 1 }),
+  run: async (g, ci) => { const h = g.C[ci.host]; if (h) await g.damage(h, 1, { source: 'Claridad de propósito' }); } }] });
+// obligación y archienemigo de SP//dr
+R('31025', { whenRevealed: async (g, ci, p) => obligation(g, ci, p, 'Agotar a Peni Parker → retirar la obligación de la partida',
+  () => !isHero(g, p) && !id(g, p).ex, async () => { id(g, p).ex = true; },
+  'Descartar 1 mejora Interfaz que controlas y descartar la obligación', async () => { const list = interfaces(g, p).filter((u) => !g.kw(u, 'permanent')); if (!list.length) { g.log('No controlas mejoras Interfaz que se puedan descartar.'); return; } const u = await g.pickOne('Descarta una mejora Interfaz', list, { player: p.idx }); if (u) await g.discard(u); }) });
+R('31026', { on: { thwartInit: [{ cond: (g, ci, ctx) => ctx.scheme === ci && ctx.player, run: async (g, ci, ctx) => {
+  const p = ctx.player;
+  if (g.canAfford(p, { n: 1, types: { energy: 1 } }) && await g.pay(p, { n: 1, types: { energy: 1 } }, null, 'Coste adicional para desbaratar ' + g.d(ci).name + ': 1 [energía]')) return;
+  ctx.amount = 0; g.log('No se paga el coste adicional ([energía]): no se retira amenaza de ' + g.d(ci).name + '.', 'warn');
+} }] } });
+R('31027', { on: { resourcesGenerated: [{ cond: (g, ci, ctx) => g.engagedWith(ci) === ctx.player && isHero(g, ctx.player) && ctx.n > 0, run: async (g, ci, ctx) => g.damage(id(g, ctx.player), ctx.n, { source: 'M.O.R.B.I.U.S.' }) }] } });
+R('31028', {
+  whenRevealedAE: async (g, ci, p) => { const ok = g.canAfford(p, { n: 2, types: { energy: 2 } }); await L.chooseOne(g, p, g.d(ci).name, [
+    { label: 'Gastar [energía][energía]', ok, run: async () => { if (!(await g.pay(p, { n: 2, types: { energy: 2 } }, null, 'Paga [energía][energía]'))) { id(g, p).ex = true; } } },
+    { label: 'Agotar tu identidad', run: async () => { id(g, p).ex = true; g.log(g.name(id(g, p)) + ' se agota.'); } }]); },
+  whenRevealedHero: async (g, ci, p) => { const ok = g.canAfford(p, { n: 2, types: { energy: 2 } }); await L.chooseOne(g, p, g.d(ci).name, [
+    { label: 'Gastar [energía][energía]', ok, run: async () => { if (!(await g.pay(p, { n: 2, types: { energy: 2 } }, null, 'Paga [energía][energía]'))) await g.damage(id(g, p), 3, { source: g.d(ci).name }); } },
+    { label: 'Sufrir 3 de daño', run: async () => g.damage(id(g, p), 3, { source: g.d(ci).name }) }]); },
+});
+// Seis Siniestros de Iron Spider (módulo)
+const criminals = (g) => g.minions().filter((c) => hasT(g, c, 'Criminal'));
+R('31030', { noThreatRemoval: (g) => criminals(g).length > 0 });
+R('31031', { on: { enemyAttackInit: [{ cond: (g, ci, ctx) => ctx.enemy === ci, run: async (g, ci, ctx) => { ctx.divide = true; } }] },
+  boost: async (g, ci) => { for (const q of g.order()) { const list = g.friendlyCharacters(q).filter((c) => g.inPlay(c)); const t = list.length === 1 ? list[0] : await g.pickOne(q.name + ': daño indirecto 1 (el personaje se agota)', list, { player: q.idx }); if (t && await g.damage(t, 1, { source: 'Bombshell', indirect: true }) > 0 && g.inPlay(t)) t.ex = true; } } });
+R('31032', { stat: (g, src, tgt, s) => (tgt === src && s === 'hp' && g.inPlay(src) ? g.attachments(src).reduce((n, a) => n + printed(g.d(a), 'energy'), 0) : 0),
+  on: {
+    minionEntered: [{ cond: (g, ci, ctx) => ctx.card === ci && ctx.player, run: async (g, ci, ctx) => electroGrab(g, ci, ctx.player) }],
+    afterEnemyActivation: [{ cond: (g, ci, ctx) => ctx.enemy === ci && ctx.player && g.inPlay(ci), run: async (g, ci, ctx) => electroGrab(g, ci, ctx.player) }],
+  } });
+async function electroGrab(g, ci, p) {
+  const list = g.cards(g.pz(p, 'hand')).filter((c) => printed(g.d(c), 'energy') > 0);
+  if (!list.length) return;
+  const c = await g.pickOne('Electro: elige una carta de tu mano con [energía] impresa (se vincula a ella)', list, { player: p.idx });
+  if (c) { g.put(c, 'attached'); c.host = ci.iid; c.ctrl = null; g.log(g.d(c).name + ' se vincula a Electro.', 'bad'); g.update(); }
+}
+R('31033', { on: { enemyWouldAttack: [{ cond: (g, ci, ctx) => ctx.enemy === ci && ctx.player && ci.stun <= 0, run: async (g, ci, ctx) => {
+  ctx.cancel = true; const n = g.stat(ci, 'atk'); let icons = 0;
+  for (let k = 0; k < n; k++) { const c = await g.drawEncounterCard(); if (!c) break; g.put(c, 'enc.discard'); icons += g.d(c).boost || 0; }
+  g.log('El Duende: en lugar de atacar se descartan ' + n + ' cartas de encuentro (' + icons + ' iconos de potenciación).', 'bad');
+  if (icons) await L.indirect(g, ctx.player, icons);
+} }] } });
+const mill7 = async (g) => { let k = 0; for (; k < 7; k++) { const c = await g.drawEncounterCard(); if (!c) break; g.put(c, 'enc.discard'); } g.log('Se descartan ' + k + ' cartas del mazo de encuentros.'); };
+R('31035', { on: { afterDamage: [{ cond: (g, ci, ctx) => ctx.target === ci && ctx.attack, run: async (g) => mill7(g) }] }, boost: async (g) => mill7(g) });
+R('31036', { on: { afterDamage: [{ cond: (g, ci, ctx) => ctx.target === ci, run: async (g, ci) => { ci.x.excess = g.hpLeft(ci) < 0; } }] },
+  whenDefeated: async (g, ci) => { if (!ci.x.excess) { await g.leavePlay(ci, 'enc.deck'); MC.shuffle(g.z('enc.deck')); g.log('Mancha vuelve al mazo de encuentros (derrotado sin exceso de daño).'); } },
+  boost: async (g, ci, ctx) => { const p = ctx.player; if (!p) return; await stealFromBoost(ctx, ci); g.resetCard(ci); await g.engageMinion(ci, p, { cancelWR: true }); } });
+R('31037', { grantKw: grantIf((g, src, tgt) => g.d(tgt).type === 'minion' && hasT(g, tgt, 'Criminal'), { surge: true }),
+  abilities: [{ kind: 'action', label: 'Gastar 2 recursos → descartar esta carta', heroOnly: true, cost: { res: 2 }, cond: (g) => !criminals(g).length, run: async (g, ci) => g.discard(ci) }] });
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* Scripts a mano: Motivos Siniestros (caja) — Ghost-Spider, Spider-Man (Miles Morales), cartas de aspecto, Sandman, Venom, Mysterio, módulos, obligaciones y archienemigos. */
+(function (root) {
+'use strict';
+const FX = root.MC_FX;
+const L = FX.L;
+const MC = root.MC;
+const R = (c, def) => FX.register(c, def);
+const id = (g, p) => g.idOf(p);
+const hasT = (g, c, t) => g.hasTrait(c, t);
+const V = (g) => g.villain();
+const isHero = (g, p) => g.isHeroForm(p);
+const inPlayCode = (g, code) => g.allInPlay().find((c) => c.code === code && !c.faceDown) || null;
+const ctrlCode = (g, p, code) => g.controlled(p).find((c) => c.code === code) || null;
+const idTrait = (g, p, t) => hasT(g, id(g, p), t);
+const printed = (d, k) => d[{ mental: 'rM', energy: 'rE', physical: 'rP', wild: 'rW' }[k]] || 0;
+const ctxSurge = (ctx) => { if (ctx) ctx.surge = true; };
+const isEventRI = (d) => d.type === 'event' && /<b>\s*(Hero |Alter-Ego )?(Interrupt|Response)/i.test(d.textEn || '');
+const ctrlWW = (g, p, not) => g.controlled(p).filter((c) => c !== not && !c.faceDown && hasT(g, c, 'Web-Warrior'));
+const shieldCards = (g, p) => g.controlled(p).filter((c) => !c.faceDown && hasT(g, c, 'S.H.I.E.L.D.'));
+const atkEnemy = async (g, p, ci, n, o = {}) => { const t = o.target || await g.chooseEnemy(p, o.title || ('Inflige ' + n + ' de daño: elige un enemigo'), { minionOnly: o.minionOnly }); if (!t) return null; return g.attackEnemy(id(g, p), t, n + (ci ? g.eventBonus(ci, 'dmg') : 0), { player: p, card: ci, overkill: o.overkill, piercing: o.piercing }); };
+const thwEvent = async (g, p, ci, n, o = {}) => { const s = o.scheme || await g.chooseScheme(p, o.title || ('Retira ' + n + ' de amenaza: elige un plan'), { exclude: o.exclude }); if (!s) return null; return g.thwartScheme(id(g, p), s, n + (ci ? g.eventBonus(ci, 'thr') : 0), { player: p }); };
+async function searchZones(g, p, zones, pred, title, o = {}) {
+  const list = zones.flatMap((z) => g.cards(g.pz(p, z))).filter((c) => pred(g.d(c), c));
+  const c = list.length ? (list.length === 1 && !o.optional ? list[0] : await g.pickOne(title, list, { player: p.idx, optional: o.optional })) : null;
+  if (zones.includes('deck')) MC.shuffle(g.z(g.pz(p, 'deck')));
+  return c;
+}
+async function obligation(g, ci, p, removeLabel, removeOk, removeRun, otherLabel, otherRun) {
+  if (isHero(g, p) && p.aes.length && await g.confirm(p.name + ': ¿cambiar a forma de Alter ego? (opcional)')) await g.flip(p, { free: true, to: p.aes[0] });
+  await L.chooseOne(g, p, g.d(ci).name, [
+    { label: removeLabel, ok: removeOk(), run: async () => { await removeRun(); await g.removeFromGame(ci); } },
+    { label: otherLabel, run: otherRun },
+  ]);
+}
+async function revealBoost(g, ci, ctx) { ctx.boostCards = ctx.boostCards.filter((b) => b !== ci); g.resetCard(ci); g.log('Potenciación: se revela ' + g.d(ci).name + '.'); await g.reveal(ci, ctx.player || g.firstPlayer()); }
+async function dealSelf(g, ci, p, ctx) { if (ctx && ctx.boostCards) ctx.boostCards = ctx.boostCards.filter((b) => b !== ci); g.resetCard(ci); ci.faceDown = true; g.put(ci, g.pz(p, 'fd')); g.log(g.d(ci).name + ' se reparte bocabajo a ' + p.name + '.', 'bad'); g.update(); }
+async function encIntoDeck(g, p, n) {
+  let k = 0;
+  for (; k < n; k++) { const c = await g.drawEncounterCard(); if (!c) break; g.resetCard(c); g.put(c, g.pz(p, 'deck')); }
+  MC.shuffle(g.z(g.pz(p, 'deck')));
+  if (k) g.log(k + ' carta(s) de encuentro se barajan en el mazo de ' + p.name + '.', 'bad');
+}
+const trackExcess = { afterDamage: [{ cond: (g, ci, ctx) => ctx.target === ci, run: async (g, ci, ctx) => { ci.x.excess = g.hpLeft(ci) < 0; ci.x.excessBy = ctx.byPlayer ? ctx.byPlayer.idx : null; } }] };
+const attachToId = (g, ci, p) => id(g, p);
+
+// ===================== GHOST-SPIDER =====================
+const george = (g, p) => ctrlCode(g, p, '27007');
+const heldOn = (g, ci) => g.cards('held').filter((c) => c.x && c.x.heldBy === ci.iid);
+R('27001a', { on: { afterPlay: [{ cond: (g, ci, ctx, p) => ctx.player === p && isEventRI(g.d(ctx.card)) && ci.ex && !g.hasLimit('gs:' + p.idx), run: async (g, ci, ctx, p) => { g.setLimit('gs:' + p.idx, 'phase'); ci.ex = false; g.log('Reflejos vertiginosos: Ghost-Spider se prepara.', 'good'); } }] } });
+R('27001b', { abilities: [{ kind: 'action', label: 'Barajar el Billete al multiverso o preparar a George Stacy', aeOnly: true, limit: 'round',
+  cond: (g, ci, p) => g.cards(g.pz(p, 'discard')).some((c) => c.code === '27008') || (george(g, p) && george(g, p).ex),
+  run: async (g, ci, p) => L.chooseOne(g, p, 'Gwen Stacy', [
+    { label: 'Barajar Billete al multiverso de tu descarte en tu mazo', ok: g.cards(g.pz(p, 'discard')).some((c) => c.code === '27008'), run: async () => { const c = g.cards(g.pz(p, 'discard')).find((c) => c.code === '27008'); g.put(c, g.pz(p, 'deck')); MC.shuffle(g.z(g.pz(p, 'deck'))); g.log('Billete al multiverso se baraja en el mazo.'); } },
+    { label: 'Preparar a George Stacy', ok: !!george(g, p) && george(g, p).ex, run: async () => { george(g, p).ex = false; g.log('George Stacy se prepara.'); } },
+  ]) }] });
+async function holdOnGeorge(g, p, ev) { const gs = george(g, p); if (!gs || !ev) return; g.put(ev, 'held'); ev.faceDown = false; ev.x.playAs = p.idx; ev.x.heldBy = gs.iid; g.log(g.d(ev).name + ' se vincula bocabajo a George Stacy.'); g.update(); }
+R('27003', { aeOnly: true, play: async (g, ci, p) => {
+  if (george(g, p)) {
+    if (heldOn(g, george(g, p)).length >= 3) { g.log('George Stacy ya tiene 3 eventos.'); return; }
+    const list = [...g.cards(g.pz(p, 'hand')), ...g.cards(g.pz(p, 'discard'))].filter((c) => g.d(c).type === 'event' && c !== ci);
+    const ev = list.length ? await g.pickOne('Consejo paterno: elige un evento de tu mano o descarte', list, { player: p.idx }) : null;
+    await holdOnGeorge(g, p, ev);
+  } else {
+    const c = await searchZones(g, p, ['deck', 'discard'], (d) => d.code === '27007', 'Busca a George Stacy');
+    if (c) { g.put(c, g.pz(p, 'hand')); g.log('George Stacy pasa a la mano de ' + p.name + '.'); } else g.log('No se encuentra a George Stacy.');
+  }
+} });
+R('27005', { windowOnly: true, on: { encounterRevealed: [{ src: 'hand', optional: true, heroOnly: true, label: 'daño al villano y anular «Cuando se muestre»',
+  cond: (g, ci, ctx) => !ctx.cancelled && !!V(g), run: async (g, ci, ctx, p) => { const n = (g.d(ctx.card).boost || 0) + 1; ctx.cancelWhenRevealed = true; await g.damage(V(g), n, { byPlayer: p, source: g.d(ci).name }); } }] } });
+R('27006', { windowOnly: true, req: { mental: 1 }, on: { enemyActivationInit: [{ src: 'hand', optional: true, heroOnly: true, label: 'anular la activación',
+  cond: (g, ci, ctx) => !!ctx.enemy && !ctx.cancel, run: async (g, ci, ctx, p) => { ctx.cancel = true; g.log('Red aglutinante: se anula la activación de ' + g.name(ctx.enemy) + '.', 'good'); if (g.isMinion(ctx.enemy)) await g.damage(ctx.enemy, 4, { byPlayer: p, source: g.d(ci).name }); } }] } });
+R('27007', { leave: async (g, ci) => { for (const ev of heldOn(g, ci)) { const o = g.P(ev.owner); g.put(ev, g.pz(o, 'discard')); } },
+  abilities: [
+    { kind: 'action', label: 'Vincular un evento de tu mano', cost: { exhaust: true }, cond: (g, ci, p) => heldOn(g, ci).length < 3 && g.cards(g.pz(p, 'hand')).some((c) => g.d(c).type === 'event'),
+      run: async (g, ci, p) => { const ev = await g.pickOne('Elige un evento de tu mano', g.cards(g.pz(p, 'hand')).filter((c) => g.d(c).type === 'event'), { player: p.idx }); await holdOnGeorge(g, p, ev); } },
+    { kind: 'action', label: 'Jugar un evento vinculado', cond: (g, ci, p) => heldOn(g, ci).some((ev) => g.playableNow(p, ev).ok),
+      run: async (g, ci, p) => {
+        const list = heldOn(g, ci).filter((ev) => g.playableNow(p, ev).ok);
+        const ev = await g.pickOne('Elige un evento vinculado a George Stacy', list, { player: p.idx, optional: true });
+        if (!ev) return;
+        g.put(ev, g.pz(p, 'hand'));
+        await g.playCard(p, ev);
+        if (ev.zone === g.pz(p, 'hand')) g.put(ev, 'held');
+      } },
+  ] });
+R('27008', { abilities: [{ kind: 'action', label: 'Billete al multiverso', run: async (g, ci, p) => {
+  await g.removeFromGame(ci);
+  for (const c of g.cards(g.pz(p, 'hand'))) g.put(c, g.pz(p, 'discard'));
+  for (const c of g.cards(g.pz(p, 'discard'))) g.put(c, g.pz(p, 'deck'));
+  MC.shuffle(g.z(g.pz(p, 'deck')));
+  g.log(p.name + ' descarta su mano y baraja su descarte en el mazo.');
+  await g.drawUpTo(p);
+  for (const c of g.controlled(p)) if (g.d(c).set === 'ghost_spider' || g.isIdentity(c)) c.ex = false;
+  g.log('Se preparan las cartas de Ghost-Spider.');
+} }] });
+R('27009', { on: { afterPlay: [{ optional: true, heroOnly: true, label: 'robar 1 carta', cost: { exhaust: true }, cond: (g, ci, ctx, p) => ctx.player === p && isEventRI(g.d(ctx.card)), run: async (g, ci, ctx, p) => g.draw(p, 1) }] } });
+R('27010', { on: { afterPlay: [{ cond: (g, ci, ctx, p) => ctx.card === ci && ctrlWW(g, p, ci).length > 0, run: async (g, ci) => {
+  const c = await g.searchEncounter((d) => d.type === 'treachery', { discardToo: false });
+  if (c) { g.put(c, 'enc.discard'); g.log('Seda descarta ' + g.d(c).name + ' del mazo de encuentros.', 'good'); } else g.log('No hay traiciones en el mazo de encuentros.');
+} }] } });
+R('27011', { on: { afterPlay: [{ cond: (g, ci, ctx, p) => ctx.card === ci && g.controlled(p).filter((c) => hasT(g, c, 'Web-Warrior')).length >= 3, run: async (g, ci, ctx, p) => {
+  const t = await g.pickOne('Spider-Man: aturde y confunde a un enemigo', g.enemies(), { player: p.idx }); if (t) { await g.stun(t); await g.confuse(t); }
+} }] } });
+R('27012', { on: { defenderChosen: [{ cond: (g, ci, ctx) => ctx.defender === ci && g.inPlay(ctx.enemy), run: async (g, ci, ctx, p) => { const n = g.controlled(p).filter((c) => hasT(g, c, 'Web-Warrior')).length; if (n) await g.damage(ctx.enemy, n, { byPlayer: p, source: 'Spider-UK' }); } }] } });
+R('27015', { heroOnly: true, attackEvent: true, play: async (g, ci, p) => {
+  const t = await g.discardUntil((d) => d.type === 'treachery');
+  if (!t) { g.log('No se encuentra ninguna traición.'); return; }
+  await g.reveal(t, p);
+  if (!p.alive || !V(g)) return;
+  if (g.blockedFromVillain(p)) { g.log('Un esbirro con Guardia impide atacar al villano.', 'warn'); return; }
+  await atkEnemy(g, p, ci, 5, { target: V(g) });
+} });
+R('27016', { heroOnly: true, req: { physical: 1 }, canPlay: (g, ci, p) => id(g, p).dmg >= 2, play: async (g, ci, p) => { await g.heal(id(g, p), 2); id(g, p).ex = false; g.log(g.name(id(g, p)) + ' se prepara.'); } });
+R('27017', { canPlay: (g, ci, p) => ctrlWW(g, p).length > 0, leave: async (g, ci) => {
+  let n = 0; for (let k = 0; k < 3; k++) { const c = await g.drawEncounterCard(); if (!c) break; g.put(c, 'enc.discard'); n += g.d(c).boost || 0; }
+  g.log('Spider-Man descarta 3 cartas de encuentro (' + n + ' iconos de potenciación).');
+  const p = g.ownerP(ci);
+  if (n && V(g)) await g.damage(V(g), n, { byPlayer: p, source: 'Spider-Man' });
+} });
+async function spiderVerse(g, p) {
+  const ww = ctrlWW(g, p).filter((c) => !c.ex);
+  const allies = g.cards(g.pz(p, 'discard')).filter((c) => g.d(c).type === 'ally' && hasT(g, c, 'Web-Warrior'));
+  if (!ww.length || !allies.length) { g.log(p.name + ' no puede resolver A través del Spider-Verso.'); return false; }
+  const e = await g.pickOne('Agota una carta Guerrero Arácnido que controles', ww, { player: p.idx }); if (!e) return false;
+  e.ex = true;
+  const a = await g.pickOne('Elige un aliado Guerrero Arácnido de tu descarte', allies, { player: p.idx }); if (!a) return false;
+  await g.enterPlay(a, p, g.pz(p, 'play')); g.log(g.d(a).name + ' entra en juego.', 'good');
+  return true;
+}
+R('27018', { heroOnly: true, canPlay: (g, ci, p) => ctrlWW(g, p).some((c) => !c.ex), play: async (g, ci, p) => {
+  if (!(await spiderVerse(g, p))) return;
+  for (let k = 0; k < 10; k++) {
+    const q = await L.choosePlayer(g, p, 'Elige un jugador (puede gastar 3 recursos para repetir)');
+    if (!q || !g.canAfford(q, { n: 3 }) || !(await g.confirm(q.name + ': ¿gastas 3 recursos para repetir la habilidad?'))) return;
+    if (!(await g.pay(q, { n: 3 }, null, 'Paga 3 recursos'))) return;
+    if (!(await spiderVerse(g, q))) return;
+  }
+} });
+const idOfSet = (g, set) => g.alive().map((q) => id(g, q)).find((c) => g.d(c).set === set);
+R('27019', { aeOnly: true, canPlay: (g) => !!idOfSet(g, 'ghost_spider') && !!idOfSet(g, 'spider_man_morales'), play: async (g) => { for (const set of ['ghost_spider', 'spider_man_morales']) { const c = idOfSet(g, set); if (c) await g.heal(c, 3); } } });
+R('27023', { costMod: (g, ci, p) => (idTrait(g, p, 'Web-Warrior') ? -(g.d(ci).cost || 0) : 0), on: { afterDefeated: [{ optional: true, label: 'un jugador roba 1 carta', cond: (g, ci, ctx) => ctx.type === 'ally' && hasT(g, ctx.card, 'Web-Warrior'), run: async (g, ci, ctx, p) => { const q = await L.choosePlayer(g, p, 'Elige un jugador que robe 1 carta'); if (q) await g.draw(q, 1); } }] } });
+R('27024', { enter: async (g, ci, p) => {
+  const qs = g.alive().filter((q) => !ctrlCode(g, q, '27024') || q === p && g.controlled(p).filter((c) => c.code === '27024').length === 1);
+  if (qs.length <= 1) return;
+  const q = g.P(await g.ask('Plan B: ¿bajo el control de qué jugador?', qs.map((x) => ({ label: x.name, value: x.idx })), { always: true, player: p.idx }));
+  if (q && q !== p) { ci.ctrl = q.idx; g.put(ci, g.pz(q, 'play')); g.log('Plan B entra en juego bajo el control de ' + q.name + '.'); }
+}, abilities: [{ kind: 'action', label: 'Descartar 1 carta al azar → 2 de daño', heroOnly: true, cost: { exhaust: true }, cond: (g, ci, p) => g.cards(g.pz(p, 'hand')).length > 0, run: async (g, ci, p) => {
+  await g.randomDiscard(p, 1);
+  const t = await g.chooseEnemy(p, 'Plan B: inflige 2 de daño a un enemigo', { ignoreGuard: true }); if (t) await g.damage(t, 2, { byPlayer: p, source: 'Plan B' });
+} }] });
+
+// ===================== SPIDER-MAN (MILES MORALES) =====================
+async function venomBlast(g, p) { const t = await g.chooseEnemy(p, 'Descarga venenosa: inflige 2 de daño y aturde a un enemigo', { ignoreGuard: true }); if (!t) return; await g.damage(t, 2, { byPlayer: p, source: 'Descarga venenosa' }); if (g.inPlay(t)) await g.stun(t); }
+async function camouflage(g, p) { await g.toughen(id(g, p)); const t = await g.pickOne('Camuflaje arácnido: confunde a un enemigo', g.enemies(), { player: p.idx }); if (t) await g.confuse(t); }
+R('27030a', {});
+R('27030b', { on: { afterFlip: [{ cond: (g, ci, ctx, p) => ctx.player === p && !ctx.toHero && g.cards(g.pz(p, 'discard')).some((c) => g.d(c).set === 'spider_man_morales'), run: async (g, ci, ctx, p) => {
+  const c = await g.pickOne('Miles Morales: baraja 1 carta de Spider-Man de tu descarte en tu mazo', g.cards(g.pz(p, 'discard')).filter((c) => g.d(c).set === 'spider_man_morales'), { player: p.idx, optional: true });
+  if (c) { g.put(c, g.pz(p, 'deck')); MC.shuffle(g.z(g.pz(p, 'deck'))); g.log(g.d(c).name + ' se baraja en el mazo.'); }
+} }] } });
+R('27031', { heroOnly: true, attackEvent: true, play: async (g, ci, p) => {
+  const t = await g.chooseEnemy(p, 'Arañobacias: inflige 2 de daño (+3 si está aturdido, +3 si está confundido)'); if (!t) return;
+  const n = 2 + (t.stun > 0 ? 3 : 0) + (t.conf > 0 ? 3 : 0);
+  await atkEnemy(g, p, ci, n, { target: t });
+} });
+R('27033', { heroOnly: true, thwartEvent: true, play: async (g, ci, p) => { await thwEvent(g, p, ci, 4); if (g.paidWith(ci, 'mental')) await camouflage(g, p); } });
+R('27034', { heroOnly: true, attackEvent: true, play: async (g, ci, p) => { await atkEnemy(g, p, ci, 4); if (g.paidWith(ci, 'energy')) await venomBlast(g, p); } });
+R('27036', { abilities: [{ kind: 'action', label: 'Retirar 1 de amenaza del plan con menos amenaza', aeOnly: true, cost: { exhaust: true }, run: async (g, ci, p) => {
+  const ss = g.schemes().filter((s) => g.canRemoveThreat(s)); if (!ss.length) return;
+  const mn = Math.min(...ss.map((s) => s.thr)); const best = ss.filter((s) => s.thr === mn);
+  const s = best.length === 1 ? best[0] : await g.pickOne('Elige el plan con menos amenaza', best, { player: p.idx });
+  if (s) await g.removeThreat(s, 1);
+} }] });
+const afterBasicSpecial = (fn, label) => ({ on: { afterBasicPower: [{ optional: true, heroOnly: true, label, cond: (g, ci, ctx, p) => ctx.player === p && isHero(g, p), run: async (g, ci, ctx, p) => { await g.discard(ci); await fn(g, p); } }] } });
+R('27037', afterBasicSpecial(venomBlast, 'descartar → Descarga venenosa'));
+R('27038', afterBasicSpecial(camouflage, 'descartar → Camuflaje arácnido'));
+R('27040', { enter: async (g, ci, p) => {
+  const c = await searchZones(g, p, ['deck', 'hand', 'discard'], (d) => d.code === '01064', 'Busca un Equipo de vigilancia');
+  if (c) await g.enterPlay(c, p, g.pz(p, 'play'));
+  for (const s of g.controlled(p).filter((x) => x.code === '01064')) s.ctr++;
+  g.log('Monica Chang: +1 contador de espionaje en cada Equipo de vigilancia.');
+} });
+R('27041', { costMod: (g) => -g.enemies().filter((e) => e.conf > 0).length });
+R('27042', { play: async (g, ci, p) => {
+  const ready = shieldCards(g, p).filter((c) => !c.ex);
+  const sel = await g.askCards('Agota hasta 3 cartas S.H.I.E.L.D. que controles', ready, { min: 0, max: Math.min(3, ready.length), player: p.idx, always: true });
+  for (const c of sel) c.ex = true;
+  if (!sel.length) return;
+  const s = await g.chooseScheme(p, 'Retira ' + 2 * sel.length + ' de amenaza de un plan'); if (s) await g.removeThreat(s, 2 * sel.length);
+} });
+R('27043', { canPlay: (g, ci, p) => shieldCards(g, p).some((c) => !c.ex), play: async (g, ci, p) => {
+  const e = await g.pickOne('Agota 1 carta S.H.I.E.L.D. que controles', shieldCards(g, p).filter((c) => !c.ex), { player: p.idx }); if (!e) return; e.ex = true;
+  const decks = [...g.alive().map((q) => ({ label: 'Mazo de ' + q.name, value: g.pz(q, 'deck') })), { label: 'Mazo de encuentros', value: 'enc.deck' }];
+  const z = await g.ask('Logística global: ¿qué mazo miras?', decks, { always: true, player: p.idx });
+  const top = g.cards(z).slice(-4).reverse();
+  if (!top.length) return;
+  const disc = await g.askCards('Descarta las cartas que quieras (el resto vuelve arriba)', top, { min: 0, max: top.length, player: p.idx, always: true });
+  for (const c of disc) g.put(c, z === 'enc.deck' ? 'enc.discard' : z.replace('.deck', '.discard'));
+  const rest = top.filter((c) => !disc.includes(c));
+  for (const c of rest) { if (rest.length && await g.confirm('¿Pones ' + g.d(c).name + ' en el fondo del mazo?', { yes: 'Al fondo', no: 'Arriba' })) g.put(c, z, true); }
+  g.log(p.name + ' mira ' + top.length + ' cartas y descarta ' + disc.length + '.');
+} });
+R('27044', { uses: 3, on: { wouldTakeDamage: [{ optional: true, heroOnly: true, label: 'evitar 1 daño de consecuencia', cost: { exhaust: true, uses: 1 }, cond: (g, ci, ctx) => ctx.source === 'consecuencia' && g.d(ctx.target).type === 'ally' && hasT(g, ctx.target, 'S.H.I.E.L.D.'),
+  run: async (g, ci, ctx) => { ctx.n -= 1; g.log('Agente de campo evita 1 de daño de consecuencia.'); } }] } });
+const readyShieldSupport = async (g, ci, p) => { const list = g.allInPlay().filter((c) => g.d(c).type === 'support' && hasT(g, c, 'S.H.I.E.L.D.') && c.ex); if (!list.length) return; const s = await g.pickOne('Agente 13: prepara un apoyo S.H.I.E.L.D.', list, { player: p.idx }); if (s) { s.ex = false; g.log(g.d(s).name + ' se prepara.'); } };
+R('27046', { on: { afterHeroAttack: [{ cond: (g, ci, ctx) => ctx.attacker === ci, run: readyShieldSupportH() }], afterThwart: [{ cond: (g, ci, ctx) => ctx.thwarter === ci, run: readyShieldSupportH() }] } });
+function readyShieldSupportH() { return async (g, ci, ctx, p) => readyShieldSupport(g, ci, p); }
+R('27047', { on: { basicPowerInit: [{ optional: true, label: 'agotar cartas S.H.I.E.L.D. para +1 cada una', cond: (g, ci, ctx, p) => ctx.char === ci && shieldCards(g, p).some((c) => c !== ci && !c.ex), run: async (g, ci, ctx, p) => {
+  const list = shieldCards(g, p).filter((c) => c !== ci && !c.ex);
+  const sel = await g.askCards('Agota hasta 3 cartas S.H.I.E.L.D.', list, { min: 0, max: Math.min(3, list.length), player: p.idx, always: true });
+  for (const c of sel) c.ex = true;
+  ctx.bonus += sel.length; if (sel.length) g.log('Dum Dum Dugan recibe +' + sel.length + '.');
+} }] } });
+R('27048', { canPlay: (g, ci, p) => ctrlWW(g, p).length > 0, leave: async (g, ci) => {
+  const p = g.ownerP(ci); if (!p || !p.alive) return;
+  await L.searchDeck(g, p, (d) => d.type === 'event' && d.fac === 'hero', 'Ghost-Spider: busca un evento específico de identidad');
+} });
+const ww2 = (g, ci, p) => g.friendlyCharacters(null).filter((c) => c !== ci && c.ex && hasT(g, c, 'Web-Warrior'));
+const readyWW = async (g, ci, ctx, p) => { const list = ww2(g, ci, p); if (!list.length) return; const c = await g.pickOne('Spider-Man: prepara a otro personaje Guerrero Arácnido', list, { player: p.idx }); if (c) { c.ex = false; g.log(g.name(c) + ' se prepara.'); } };
+R('27049', { req: { energy: 1, mental: 1, physical: 1 }, on: { afterHeroAttack: [{ cond: (g, ci, ctx) => ctx.attacker === ci, run: readyWW }], afterThwart: [{ cond: (g, ci, ctx) => ctx.thwarter === ci, run: readyWW }] } });
+R('27054', { abilities: [{ kind: 'action', label: 'Jugar una carta S.H.I.E.L.D. con −1 de coste', heroOnly: true, cost: { exhaust: true }, run: async (g, ci, p) => {
+  const prev = p.nextCostReduction || 0; p.nextCostReduction = prev + 1;
+  try {
+    const list = g.cards(g.pz(p, 'hand')).filter((c) => hasT(g, c, 'S.H.I.E.L.D.') && g.playableNow(p, c).ok);
+    const c = await g.pickOne('Elige una carta S.H.I.E.L.D. de tu mano', list, { player: p.idx, optional: true });
+    if (c) await g.playCard(p, c);
+  } finally { if (p.nextCostReduction) p.nextCostReduction = prev; }
+} }] });
+R('27190', { on: { encounterRevealed: [{ optional: true, label: '1 daño a Veneno → daño según los iconos de potenciación', cond: (g, ci, ctx, p) => ctx.player === p && ((g.d(ctx.card).boost || 0) + (g.d(ctx.card).boostStar ? 1 : 0)) > 0, run: async (g, ci, ctx, p) => {
+  const n = (g.d(ctx.card).boost || 0) + (g.d(ctx.card).boostStar ? 1 : 0);
+  await g.damage(ci, 1, { source: 'Veneno' });
+  const t = await g.chooseEnemy(p, 'Veneno: inflige ' + n + ' de daño a un enemigo', { ignoreGuard: true }); if (t) await g.damage(t, n, { byPlayer: p, source: 'Veneno' });
+} }] } });
+R('27191', { stat: (g, src, tgt, s) => { const p = g.ownerP(src); if (!g.inPlay(src) || !p || tgt !== id(g, p)) return 0; return ({ thw: 1, atk: 1, def: 1, rec: 1, hand: 1, hp: 10 })[s] || 0; } });
+// obligaciones y archienemigos
+R('27025', { toPlayArea: true, enter: async () => {}, whenRevealed: async (g, ci, p) => {
+  ci.ctrl = p.idx; g.put(ci, g.pz(p, 'play'));
+  const gs = [...g.cards(g.pz(p, 'deck')), ...g.cards(g.pz(p, 'hand')), ...g.cards(g.pz(p, 'discard')), ...g.cards(g.pz(p, 'play'))].find((c) => c.code === '27007');
+  if (gs) { if (g.inPlay(gs)) await g.leavePlay(gs, 'held'); else g.put(gs, 'held'); gs.x.heldBy = ci.iid; gs.faceDown = true; g.log('George Stacy se vincula bocabajo a Padre preocupado.', 'bad'); }
+  MC.shuffle(g.z(g.pz(p, 'deck')));
+}, leave: async (g, ci) => { const gs = g.cards('held').find((c) => c.x.heldBy === ci.iid); if (gs) { gs.faceDown = false; const o = g.P(gs.owner); g.put(gs, g.pz(o, 'discard')); } },
+abilities: [{ kind: 'action', label: 'Agotar a Gwen Stacy → George Stacy a tu mano y retirar la obligación', aeOnly: true, cost: { exhaustHero: true }, run: async (g, ci, p) => {
+  const gs = g.cards('held').find((c) => c.x.heldBy === ci.iid);
+  if (gs) { gs.faceDown = false; gs.x = {}; g.put(gs, g.pz(p, 'hand')); g.log('George Stacy pasa a la mano de ' + p.name + '.'); }
+  await g.removeFromGame(ci);
+} }] });
+const minionMost = async (g, ci, p, f, title) => { const ms = g.minions(); if (!ms.length) return 'surge'; const mx = Math.max(...ms.map(f)); const best = ms.filter((c) => f(c) === mx); return best.length === 1 ? best[0] : g.pickOne(title, best, { player: p.idx }); };
+R('27028', { attachHost: (g, ci, p) => minionMost(g, ci, p, (c) => g.hpLeft(c), 'Inyección experimental: esbirro con más vida restante'),
+  traits: (g, src, tgt) => (g.inPlay(src) && tgt.iid === src.host ? ['Creature'] : null), stat: (g, src, tgt, s) => (s === 'hp' && g.inPlay(src) && tgt.iid === src.host ? 4 : 0) });
+R('27029', { whenRevealed: async (g, ci, p, ctx) => {
+  const liz = g.allInPlay().find((c) => g.isMinion(c) && /Lizard/i.test(g.d(c).nameEn || ''));
+  if (!liz) return ctxSurge(ctx);
+  p.noEvents = true; try { await g.enemyAttack(liz, p); } finally { p.noEvents = false; }
+} });
+R('27056', { whenRevealed: async (g, ci, p, ctx) => obligation(g, ci, p, 'Agotar a Miles Morales → retirar la obligación de la partida',
+  () => !isHero(g, p) && !id(g, p).ex, async () => { id(g, p).ex = true; },
+  'Descartar a Ganke Lee y Jefferson Davis (si no hay ninguno, Oleada)', async () => { let n = 0; for (const code of ['27035', '27036']) { const c = ctrlCode(g, p, code); if (c) { await g.discard(c); n++; } } if (!n) ctxSurge(ctx); }) });
+R('27057', { dynIcons: (g, c) => ({ accel: c.ctr || 0 }), whenRevealed: async (g, ci, p) => { if (!isHero(g, p)) { ci.ctr = (ci.ctr || 0) + 1; g.log('Rastreando a la presa recibe 1 ficha de aceleración.', 'bad'); } } });
+R('27059', { attachHost: (g, ci, p) => minionMost(g, ci, p, (c) => g.d(c).hp || 0, 'Garras afiladas: esbirro con más vida impresa'), grantKw: (g, src, tgt) => (g.inPlay(src) && tgt.iid === src.host ? { piercing: true } : null) });
+R('27060', { whenRevealed: async (g, ci, p, ctx) => {
+  const pr = g.allInPlay().find((c) => g.isMinion(c) && /Prowler/i.test(g.d(c).nameEn || ''));
+  if (!pr) return ctxSurge(ctx);
+  const qs = g.alive(); const mn = Math.min(...qs.map((q) => g.hpLeft(id(g, q)))); const cand = qs.filter((q) => g.hpLeft(id(g, q)) === mn);
+  const q = cand.length === 1 ? cand[0] : g.P(await g.ask('Empate: ¿a qué jugador ataca el Merodeador?', cand.map((x) => ({ label: x.name, value: x.idx })), { always: true }));
+  const r = await g.enemyAttack(pr, q);
+  if (!r || r.cancel || (r.damaged && !g.inPlay(r.damaged)) || !q.alive) ctxSurge(ctx);
+} });
+// eventos bloqueados (En sangre fría)
+const origPlayable = MC.Game.prototype.playableNow;
+MC.Game.prototype.playableNow = function (p, ci) { if (p && p.noEvents && this.d(ci).type === 'event') return { ok: false, why: 'No puedes jugar eventos hasta que se resuelva el ataque.' }; return origPlayable.call(this, p, ci); };
+
+// ===================== SANDMAN =====================
+const streets = (g) => g.cards('env').find((c) => c.code === '27065') || null;
+const sand = (g) => (streets(g) ? streets(g).ctr || 0 : 0);
+async function addSand(g, n) { const s = streets(g); if (!s) return; s.ctr = (s.ctr || 0) + n; g.log('Calles de la ciudad: +' + n + ' contador(es) de arena (' + s.ctr + ').'); g.update(); }
+async function surgingSands(g) {
+  const s = streets(g); if (!s) return [];
+  await addSand(g, 1);
+  const out = [];
+  for (let k = 0; k < s.ctr; k++) { const c = await g.drawEncounterCard(); if (!c) break; g.put(c, 'enc.discard'); out.push(c); }
+  g.log('Arenas crecientes: se descartan ' + out.length + ' cartas del mazo de encuentros' + (out.length ? ' (' + out.map((c) => g.d(c).name).join(', ') + ')' : '') + '.', 'bad');
+  return out;
+}
+const sandBlast = (overkill) => ({ on: {
+  enemyAttackInit: [{ cond: (g, ci, ctx) => ctx.enemy === ci && ctx.player, run: async (g, ci, ctx) => { if (overkill) ctx.overkill = true; ci.x.idDmg = id(g, ctx.player).dmg; } }],
+  afterEnemyAttack: [{ cond: (g, ci, ctx) => ctx.enemy === ci && ctx.player && ctx.player.alive && id(g, ctx.player).dmg > (ci.x.idDmg ?? 1e9), run: async (g, ci) => { ci.x.idDmg = null; await surgingSands(g); } }],
+} });
+R('27061', { indirectAttack: true, ...sandBlast(false) });
+R('27062', { indirectAttack: true, ...sandBlast(false), whenRevealed: async (g) => { await surgingSands(g); } });
+R('27063', { ...sandBlast(true), whenRevealed: async (g) => { await addSand(g, 1); await surgingSands(g); } });
+R('27064a', { setup: async (g) => {
+  let s = await g.searchEncounter((d) => d.code === '27065');
+  if (!s) s = g.mk('27065', null, 'aside');
+  g.put(s, 'env'); s.ctr = 4;
+  g.log('Calles de la ciudad entra en juego con 4 contadores de arena.');
+} });
+R('27064b', { on: { accelTokenPlaced: [{ run: async (g) => { const q = g.firstPlayer(); g.log('Peatones indefensos: 3 de daño indirecto al primer jugador.', 'bad'); await L.indirect(g, q, 3); } }] } });
+R('27065', { abilities: [{ kind: 'action', label: 'Agotar un personaje → retirar arena igual a su ATQ', heroOnly: true,
+  cond: (g, ci, p) => !g.hasLimit('cs:' + p.idx) && (ci.ctr || 0) > 0 && g.friendlyCharacters(p).some((c) => !c.ex),
+  run: async (g, ci, p) => {
+    const c = await g.pickOne('Agota un personaje que controles', g.friendlyCharacters(p).filter((c) => !c.ex), { player: p.idx }); if (!c) return;
+    g.setLimit('cs:' + p.idx, 'round'); c.ex = true;
+    const n = Math.min(ci.ctr, g.stat(c, 'atk')); ci.ctr -= n; g.log('Se retiran ' + n + ' contadores de arena (' + ci.ctr + ').', 'good');
+  } }] });
+R('27066', { attachHost: async (g) => V(g), on: { wouldTakeDamage: [{ cond: (g, ci, ctx) => ctx.target && ctx.target.iid === ci.host && ctx.n > 0 && !ctx.prevented && ctx.byPlayer, run: async (g, ci, ctx) => {
+  ctx.prevented = true; g.log('Forma de arena absorbe el daño y se descarta.', 'bad'); await g.discard(ci); await surgingSands(g);
+} }] }, boost: async (g, ci, ctx) => revealBoost(g, ci, ctx) });
+R('27067', { stat: (g, src, tgt, s) => (tgt === src && s === 'atk' && g.inPlay(src) ? sand(g) + 1 : 0), whenDefeated: async (g) => { await surgingSands(g); } });
+R('27068', { whenDefeated: async (g) => { await surgingSands(g); await surgingSands(g); } });
+R('27069', { whenRevealed: async (g, ci) => { const n = sand(g); if (n) await g.placeThreat(ci, n); } });
+const sandslide = async (g, ci, p) => { await addSand(g, 2); const cs = await surgingSands(g); if (cs.some((c) => g.d(c).set === 'sandman')) await g.stun(id(g, p)); };
+R('27070', { whenRevealed: sandslide, boost: async (g, ci, ctx) => sandslide(g, ci, ctx.player || g.firstPlayer()) });
+R('27071', { whenRevealed: async (g, ci, p) => {
+  const n = sand(g);
+  if (!n) { await addSand(g, 3); g.put(ci, 'enc.deck'); MC.shuffle(g.z('enc.deck')); g.log('Tormenta de arena se baraja en el mazo de encuentros.'); return; }
+  const qs = g.alive();
+  for (let k = 0; k < n; k++) { const q = qs.length === 1 ? qs[0] : g.P(await g.ask('Tormenta de arena: ¿quién recibe 1 de daño indirecto? (' + (k + 1) + '/' + n + ')', qs.filter((x) => x.alive).map((x) => ({ label: x.name, value: x.idx })), { always: true, player: p.idx })); if (q && q.alive) await L.indirect(g, q, 1); }
+} });
+R('27072', { whenRevealedAE: async (g, ci, p, ctx) => { await surgingSands(g); ctxSurge(ctx); }, whenRevealedHero: async (g, ci, p) => { const v = V(g); if (!v) return; g.addMod(v, 'atk', 1, 'attack'); await g.enemyAttack(v, p); } });
+
+// ===================== VENOM =====================
+const bell = (g) => g.cards('env').find((c) => c.code === '27077a' || c.code === '27077b') || null;
+const bellBlank = (g) => !!inPlayCode(g, '27079');
+async function bellCheck(g) {
+  const b = bell(g); if (!b || bellBlank(g)) return;
+  if (b.code === '27077a' && (b.ctr || 0) >= 3 * g.nPlayers()) { b.code = '27077b'; g.log('¡El Campanario repica! (lado Sonando)', 'bad'); g.update(); }
+  else if (b.code === '27077b' && !(b.ctr > 0)) { b.code = '27077a'; g.log('El Campanario se queda en silencio (lado Silencioso).'); g.update(); }
+}
+async function chime(g, n) { const b = bell(g); if (!b) return; b.ctr = Math.max(0, (b.ctr || 0) + n); g.log('Campanario: ' + (n > 0 ? '+' : '') + n + ' contador(es) de campanada (' + b.ctr + ').'); await bellCheck(g); }
+const fdOnId = async (g, p, n) => { const me = id(g, p); me.x.fdBoost = (me.x.fdBoost || 0) + n; g.log(p.name + ' recibe ' + n + ' carta(s) de potenciación bocabajo en su identidad (' + me.x.fdBoost + ').', 'bad'); g.update(); };
+const venomHit = (first2) => ({ afterHeroAttack: [{ cond: (g, ci, ctx) => ctx.target === ci && ctx.dealt > 0 && ctx.player && ctx.attacker && (g.isIdentity(ctx.attacker) || g.d(ctx.attacker).type === 'ally' || ctx.card),
+  run: async (g, ci, ctx) => { const key = g.round + ':' + g.active; const first = first2 && ci.x.lastAtk !== key; ci.x.lastAtk = key; await fdOnId(g, ctx.player, first ? 2 : 1); } }],
+  boostIconsCount: [{ cond: (g, ci, ctx) => ctx.attackCtx && ctx.attackCtx.enemy === ci && ci.x.biting, run: async (g, ci, ctx) => { ctx.icons += 1; } }] });
+R('27073', { on: venomHit(false) });
+R('27074', { on: venomHit(false), whenRevealed: async (g) => { if (inPlayCode(g, '27081')) return; const c = await g.searchEncounter((d) => d.code === '27081'); if (c) await g.putIntoPlay(c); } });
+R('27075', { on: venomHit(true), whenRevealed: async (g) => { for (const q of g.order()) await fdOnId(g, q, 2); } });
+R('27076a', { setup: async (g) => {
+  let b = await g.searchEncounter((d) => d.code === '27077a');
+  if (!b) b = g.mk('27077a', null, 'aside');
+  for (const x of [...g.cards('enc.deck'), ...g.cards('enc.discard')].filter((x) => x.code === '27077b')) g.put(x, 'removed');
+  g.put(b, 'env'); b.ctr = 0;
+  g.log('El Campanario entra en juego (lado Silencioso).');
+} });
+R('27076b', { on: { enemyActivationInit: [{ cond: (g, ci, ctx) => ctx.enemy === V(g) && ctx.player && (id(g, ctx.player).x.fdBoost || 0) > 0, run: async (g, ci, ctx) => {
+  const me = id(g, ctx.player); const n = me.x.fdBoost; me.x.fdBoost = 0; ctx.enemy.x.fdBoost = (ctx.enemy.x.fdBoost || 0) + n;
+  g.log('Las ' + n + ' cartas de potenciación bocabajo de ' + ctx.player.name + ' pasan a Veneno.', 'bad');
+} }] } });
+R('27077a', { on: { wouldTakeDamage: [{ optional: true, label: 'poner contadores de campanada en lugar del daño', cond: (g, ci, ctx) => !bellBlank(g) && ctx.target === V(g) && ctx.attack && ctx.n > 0, run: async (g, ci, ctx) => { const n = ctx.n; ctx.n = 0; ctx.prevented = true; await chime(g, n); } }] } });
+R('27077b', { on: {
+  wouldTakeDamage: [
+    { cond: (g, ci, ctx) => !bellBlank(g) && ctx.target === V(g) && ctx.n > 0 && !ctx.bellPlus, run: async (g, ci, ctx) => { ctx.bellPlus = true; ctx.n += 1; g.log('Campanario sonando: Veneno sufre +1 de daño.'); } },
+    { cond: (g, ci, ctx) => !bellBlank(g) && ctx.attack && ctx.attacker === V(g) && g.isIdentity(ctx.target) && ctx.n > 0 && (ci.ctr || 0) > 0, run: async (g, ci, ctx) => { const k = Math.min(ci.ctr, ctx.n); ci.ctr -= k; ctx.n -= k; g.log('El Campanario evita ' + k + ' de daño (' + ci.ctr + ' campanadas).'); await bellCheck(g); } },
+  ] } });
+R('27078', { attachHost: async (g) => V(g), enter: async (g, ci) => { ci.ctr = 2; ci.x.usesMax = 2; }, grantKw: (g, src, tgt) => (g.inPlay(src) && tgt.iid === src.host ? { overkill: true } : null),
+  on: { afterDamage: [{ cond: (g, ci, ctx) => ctx.target && ctx.target.iid === ci.host && ctx.attack && ctx.dealt > 0, run: async (g, ci) => { ci.ctr--; g.log('«¡Ahora estamos furiosos!»: −1 contador de rabia (' + ci.ctr + ').'); await g.checkUses(ci); } }] },
+  boost: async (g, ci, ctx) => revealBoost(g, ci, ctx) });
+R('27079', { whenRevealed: async (g) => { const b = bell(g); if (b) { b.ctr = 0; b.code = '27077a'; g.log('Se retiran las campanadas y el Campanario vuelve a su lado Silencioso.'); } } });
+const lashing = { afterDamage: [{ cond: (g, ci, ctx) => ctx.target === V(g) && ctx.attack && ctx.dealt > 0 && ci.thr > 0, run: async (g, ci, ctx) => g.removeThreat(ci, ctx.dealt) }] };
+R('27080', { on: lashing, boost: async (g, ci, ctx) => { if (ctx.attack && ctx.player) await L.indirect(g, ctx.player, 2); } });
+R('27081', { on: lashing, boost: async (g, ci, ctx) => { if (ctx.attack) { ctx.piercing = true; g.log('El ataque gana Perforante.'); } } });
+R('27082', { whenRevealed: async (g, ci, p) => { const v = V(g); if (!v) return; v.x.biting = true; try { await g.activate(v, p); } finally { v.x.biting = false; } }, boost: async (g) => chime(g, -1) });
+const bellToll = async (g, ci, p) => { await chime(g, -2); const b = bell(g); if (!b) return; if (b.code === '27077a') await g.damage(id(g, p), 1, { source: g.d(ci).name }); else if (g.main()) await g.removeThreat(g.main(), 1); };
+R('27083', { whenRevealed: bellToll, boost: async (g, ci, ctx) => bellToll(g, ci, ctx.player || g.firstPlayer()) });
+
+// ===================== MYSTERIO =====================
+const MYST_DEST = { '27084': 'discard', '27085': 'bottom', '27086': 'top' };
+R(['27084', '27085', '27086'], (d) => ({ on: { boostDiscarding: [{ cond: (g, ci, ctx) => ctx.attackCtx && ctx.attackCtx.enemy === ci && ctx.player && hasT(g, ctx.card, 'Illusion'), run: async (g, ci, ctx) => {
+  const w = MYST_DEST[ci.code];
+  ctx.dest = w === 'discard' ? g.pz(ctx.player, 'discard') : g.pz(ctx.player, 'deck'); ctx.bottom = w === 'bottom';
+  g.log(g.d(ctx.card).name + ' (Ilusión) va ' + (w === 'discard' ? 'al descarte' : w === 'bottom' ? 'al fondo del mazo' : 'encima del mazo') + ' de ' + ctx.player.name + '.', 'bad');
+} }] }, whenRevealed: d.code === '27085' ? async (g) => { for (const q of g.order()) await encIntoDeck(g, q, 1); } : d.code === '27086' ? async (g) => { for (const q of g.order()) await g.discardTop(q, 5); } : undefined }));
+R('27087a', { setup: async (g) => { for (const q of g.order()) { const c = await g.searchEncounter((d) => d.code === '27091'); if (c) await g.engageMinion(c, q, { cancelWR: true }); } } });
+// lado B: «cuando robarías o descartarías una carta de encuentro de tu mazo, repártetela bocabajo y roba 1» (el motor lo aplica siempre)
+R(['27087b', '27088b'], {});
+R('27088a', { whenRevealed: async (g) => { for (const q of g.order()) await encIntoDeck(g, q, 2); } });
+R('27089', { abilities: [{ kind: 'action', label: 'Pagar 1 y barajar 2 cartas de encuentro en tu mazo → descartar', heroOnly: true, cost: { res: 1 }, run: async (g, ci, p) => { await encIntoDeck(g, p, 2); await g.discard(ci); } }] });
+R('27090', { attachHost: async (g) => V(g), on: { wouldTakeDamage: [{ cond: (g, ci, ctx) => ctx.target && ctx.target.iid === ci.host && ctx.n > 0 && !ctx.prevented && ctx.byPlayer, run: async (g, ci, ctx) => {
+  ctx.prevented = true; const q = ctx.byPlayer; g.log('Espejismo magistral: el daño se evita y ' + q.name + ' descarta 4 cartas de su mazo.', 'bad'); await g.discard(ci); await g.discardTop(q, 4);
+} }] }, boost: async (g, ci, ctx) => { await g.giveBoost(ctx, 1); g.log('Mysterio recibe 1 carta de potenciación adicional.'); } });
+R('27091', { kw: { guard: true }, on: trackExcess, whenDefeated: async (g, ci) => { if (ci.x.excess && ci.x.excessBy != null) await encIntoDeck(g, g.P(ci.x.excessBy), 1); } });
+const dejaVu = async (g, ci, p) => {
+  await L.chooseOne(g, p, 'Déjà vu', [{ label: 'Sufrir 1 de daño', run: async () => g.damage(id(g, p), 1, { source: 'Déjà vu' }) }, { label: 'Poner 1 de amenaza en el plan principal', run: async () => g.placeThreat(g.main(), 1) }]);
+  const q = await L.choosePlayer(g, p, 'Déjà vu: ¿en el mazo de qué jugador se baraja?');
+  if (q) { g.resetCard(ci); g.put(ci, g.pz(q, 'deck')); MC.shuffle(g.z(g.pz(q, 'deck'))); g.log('Déjà vu se baraja en el mazo de ' + q.name + '.', 'bad'); }
+};
+R('27092', { whenRevealed: dejaVu, boost: async (g, ci, ctx) => revealBoost(g, ci, ctx) });
+R('27093', { whenRevealed: async (g, ci, p) => { for (const c of g.cards(g.pz(p, 'hand'))) g.put(c, g.pz(p, 'discard')); g.log(p.name + ' descarta su mano.'); await g.drawUpTo(p); },
+  boost: async (g, ci, ctx) => { const p = ctx.player; if (!p) return; if (g.canAfford(p, { n: 2, types: { mental: 2 } }) && await g.confirm(p.name + ': ¿gastas [mental][mental]? (si no, Alarmista se te reparte bocabajo)') && await g.pay(p, { n: 2, types: { mental: 2 } }, null, 'Paga [mental][mental]')) return; await dealSelf(g, ci, p, ctx); } });
+
+// ===================== MÓDULOS =====================
+// Ciudad en caos
+const rhino = (g) => g.minions().find((c) => c.code === '27128') || null;
+R('27128', { grantKw: (g, src, tgt) => (tgt === src && g.inPlay(src) ? { overkill: true, piercing: true } : null) });
+R('27127', { stat: () => 0 });
+const origFx = MC.Game.prototype.fx;
+MC.Game.prototype.fx = function (ci) {
+  const d = MC.CARDS[ci.code];
+  if (d && d.type === 'support' && this.Z.side && this.Z.side.length && /\b(Location|Persona)\b/.test(d.traitsEn || '') && this.inPlay(ci) && this.cards('side').some((s) => s.code === '27127' && !s.faceDown)) return { status: 'auto', kw: {}, abilities: [], on: {}, blank: true };
+  return origFx.call(this, ci);
+};
+R('27129', { whenRevealed: async (g, ci, p) => {
+  const r = rhino(g);
+  if (r) { g.addMod(r, 'sch', 2, 'attack'); await g.enemyScheme(r, g.engagedWith(r) || p); return; }
+  const c = await g.searchEncounter((d) => d.code === '27128'); if (c) await g.engageMinion(c, p, { cancelWR: true });
+} });
+R('27130', { whenRevealed: async (g, ci, p) => L.chooseOne(g, p, 'Ahora o nunca', [
+  { label: 'Colocar 1 ficha de aceleración en el plan principal', run: async () => { g.accelTokens++; g.log('Se añade 1 ficha de aceleración.', 'bad'); g.update(); } },
+  { label: 'Agotar un personaje que controlas y gastar 1 recurso', ok: g.friendlyCharacters(p).some((c) => !c.ex) && g.canAfford(p, { n: 1 }), run: async () => {
+    const c = await g.pickOne('Agota un personaje', g.friendlyCharacters(p).filter((c) => !c.ex), { player: p.idx }); if (c) c.ex = true;
+    if (!(await g.pay(p, { n: 1 }, null, 'Paga 1 recurso'))) { g.accelTokens++; g.log('No se paga: se añade 1 ficha de aceleración.', 'bad'); }
+  } },
+]) });
+// Con los pies en la tierra
+R('27131', { abilities: [{ kind: 'action', label: 'Gastar [físico] → 3 de daño a este esbirro', aeOnly: true, cost: { types: { physical: 1 } }, run: async (g, ci, p) => {
+  await g.damage(ci, 3, { byPlayer: p, source: 'Delincuente común' });
+  if (!g.inPlay(ci)) await L.chooseOne(g, p, 'Delincuente común derrotado', [{ label: 'Robar 1 carta', run: async () => g.draw(p, 1) }, { label: 'Retirar 3 de amenaza de un plan secundario', ok: g.sideSchemes().length > 0, run: async () => { const s = await g.pickOne('Elige un plan secundario', g.sideSchemes(), { player: p.idx }); if (s) await g.removeThreat(s, 3); } }]);
+} }] });
+R('27132', { toPlayArea: true, abilities: [{ kind: 'action', label: 'Descartar 1 carta específica de identidad → descartar la obligación', aeOnly: true, cond: (g, ci, p) => g.cards(g.pz(p, 'hand')).some((c) => g.d(c).fac === 'hero'),
+  run: async (g, ci, p) => { const c = await g.pickOne('Descarta una carta específica de identidad', g.cards(g.pz(p, 'hand')).filter((c) => g.d(c).fac === 'hero'), { player: p.idx }); if (c) { g.put(c, g.pz(p, 'discard')); await g.discard(ci); } } }],
+  reduceCost: (g, src, ci, p) => (g.d(ci).type === 'event' && isHero(g, p) && src.ctrl === p.idx ? -1 : 0) });
+R('27133', { noThreatRemoval: (g) => !g.allowVolunteer, abilities: [{ kind: 'action', label: 'Gastar 2 recursos → retirar amenaza igual a tu REC', aeOnly: true, cost: { res: 2 }, run: async (g, ci, p) => {
+  g.allowVolunteer = true; try { await g.removeThreat(ci, g.stat(id(g, p), 'rec')); } finally { g.allowVolunteer = false; }
+  if (idTrait(g, p, 'Civilian')) await g.draw(p, 1);
+} }] });
+R('27134', { whenRevealed: async (g, ci, p) => {
+  if (p.heroes.length && p.aes.length && await g.confirm(p.name + ': ¿cambias de forma?')) await g.flip(p, { free: true });
+  if (isHero(g, p)) await g.placeThreat(g.main(), 2);
+  else { p.noFlipNext = g.round + 1; g.log(p.name + ' no podrá cambiar de forma durante su próximo turno.', 'bad'); }
+} });
+const origCanFlip = MC.Game.prototype.canFlip;
+MC.Game.prototype.canFlip = function (p) { if (p && p.noFlipNext === this.round && this.phase === 'player') return false; return origCanFlip.call(this, p); };
+R('27135', { whenRevealed: async (g, ci, p, ctx) => {
+  const codes = p.obligations || [];
+  const c = [...g.cards('enc.deck'), ...g.cards('enc.discard'), ...g.cards('aside'), ...g.cards('removed')].find((x) => codes.includes(x.code));
+  if (!c) return ctxSurge(ctx);
+  MC.shuffle(g.z('enc.deck'));
+  const wasHero = isHero(g, p);
+  g.resetCard(c);
+  await g.reveal(c, p);
+  if (wasHero && !isHero(g, p)) await g.randomDiscard(p, 1);
+} });
+// Equipo del Duende
+R('27136', { attachHost: async (g) => V(g), on: { afterEnemyActivation: [{ cond: (g, ci, ctx) => ctx.enemy && ctx.enemy.iid === ci.host && ctx.player && ctx.player.alive && !g.hasLimit('glider:' + ctx.player.idx), run: async (g, ci, ctx) => {
+  g.setLimit('glider:' + ctx.player.idx, 'round'); g.log('Planeador avanzado: el villano se activa otra vez.', 'bad'); await g.activate(ctx.enemy, ctx.player);
+} }] }, abilities: [{ kind: 'action', label: 'Descartar cartas de Ataque (coste total 3+) → descartar esta carta', heroOnly: true,
+  cond: (g, ci, p) => g.cards(g.pz(p, 'hand')).filter((c) => /\bAttack\b/.test(g.d(c).traitsEn || '')).reduce((s, c) => s + (g.d(c).cost || 0), 0) >= 3,
+  run: async (g, ci, p) => {
+    const list = g.cards(g.pz(p, 'hand')).filter((c) => /\bAttack\b/.test(g.d(c).traitsEn || ''));
+    const sel = await g.askCards('Descarta cartas de Ataque con coste total 3 o más', list, { min: 1, max: list.length, player: p.idx });
+    if (sel.reduce((s, c) => s + (g.d(c).cost || 0), 0) < 3) { g.log('El coste total no llega a 3.', 'warn'); return; }
+    for (const c of sel) g.put(c, g.pz(p, 'discard'));
+    await g.discard(ci);
+  } }] });
+const bombs = (fn) => ({ attachHost: async (g) => V(g), enter: async (g, ci) => { ci.ctr = 2; ci.x.usesMax = 2; }, on: { afterEnemyAttack: [{ cond: (g, ci, ctx) => ctx.enemy && ctx.enemy.iid === ci.host && ctx.player && ci.ctr > 0, run: async (g, ci, ctx) => { ci.ctr--; await fn(g, ctx.player); await g.checkUses(ci); } }] } });
+R('27137', bombs(async (g, p) => { for (const t of ['upgrade', 'support']) { const list = g.controlled(p).filter((c) => g.d(c).type === t && !c.ex); if (!list.length) continue; const c = await g.pickOne('Bombas de conmoción: agota 1 ' + (t === 'upgrade' ? 'mejora' : 'apoyo'), list, { player: p.idx }); if (c) c.ex = true; } }));
+R('27139', bombs(async (g, p) => { const ev = g.cards(g.pz(p, 'hand')).filter((c) => g.d(c).type === 'event'); if (!ev.length) return; const mn = Math.min(...ev.map((c) => g.d(c).cost || 0)); const best = ev.filter((c) => (g.d(c).cost || 0) === mn); const c = best.length === 1 ? best[0] : await g.pickOne('Bombas de humo: descarta el evento de menor coste', best, { player: p.idx }); if (c) { g.put(c, g.pz(p, 'discard')); g.log(p.name + ' descarta ' + g.d(c).name + '.'); } }));
+R('27140', { grantKw: (g, src, tgt) => (g.inPlay(src) && g.d(tgt).type === 'attachment' && g.d(tgt).fac === 'encounter' && hasT(g, tgt, 'Tech') ? { surge: true } : null) });
+// Tácticas de guerrilla
+R('27142', { kw: {}, on: { minionEntered: [{ cond: (g, ci, ctx) => ctx.card === ci && g.cfg.expert, run: async (g, ci) => g.toughen(ci) }] }, boost: async (g, ci, ctx) => { const p = ctx.player; if (!p) return; ctx.boostCards = ctx.boostCards.filter((b) => b !== ci); g.resetCard(ci); await g.engageMinion(ci, p, { cancelWR: true }); } });
+const origThwartable = MC.Game.prototype.thwartableSchemes;
+MC.Game.prototype.thwartableSchemes = function (p) { const l = origThwartable.call(this, p); if (p && this.minions(p).some((m) => m.code === '27142')) return l.filter((s) => s.zone !== 'side'); return l; };
+R('27143', { dynIcons: (g) => ({ accel: g.enemies().length }), boost: async (g) => { for (const s of g.schemes()) await g.placeThreat(s, 1); if (g.cfg.expert && g.main()) await g.placeThreat(g.main(), 1); } });
+R('27144', { dynIcons: (g) => ({ hazard: g.enemies().length }), boost: async (g) => { for (const q of g.order()) await L.indirect(g, q, 1); if (g.cfg.expert) await L.indirect(g, g.firstPlayer(), 1); } });
+R('27145', { stat: (g, src, tgt, s) => (g.inPlay(src) && (s === 'sch' || s === 'atk') && g.d(tgt).fac === 'encounter' && (g.isMinion(tgt) || g.d(tgt).type === 'villain') ? 1 : 0),
+  on: { boostIconsCount: [{ cond: (g, ci, ctx) => ctx.card === ci && g.cfg.expert, run: async (g, ci, ctx) => { ctx.icons += 2; } }] } });
+R('27146', { kw: {}, whenRevealed: async (g, ci, p, ctx) => { if (g.cfg.expert) ctxSurge(ctx); const n = g.enemies().length; if (n) await g.placeThreat(g.main(), n); } });
+// Tecnología de Osborn
+const atV = { attachHost: async (g) => V(g) };
+R('27147', { ...atV, grantKw: (g, src, tgt) => (g.inPlay(src) && tgt.iid === src.host ? { overkill: true, piercing: true } : null), abilities: [{ kind: 'action', label: 'Descartar tu mejora de mayor coste → descartar esta carta', heroOnly: true, cond: (g, ci, p) => g.controlled(p).some((c) => g.d(c).type === 'upgrade' && !g.kw(c, 'permanent')), run: async (g, ci, p) => {
+  const ups = g.controlled(p).filter((c) => g.d(c).type === 'upgrade' && !g.kw(c, 'permanent')); const mx = Math.max(...ups.map((c) => g.d(c).cost || 0));
+  const c = await g.pickOne('Descarta la mejora de mayor coste', ups.filter((c) => (g.d(c).cost || 0) === mx), { player: p.idx }); if (c) { await g.discard(c); await g.discard(ci); }
+} }] });
+R('27148', { ...atV, on: { afterEnemyAttack: [{ cond: (g, ci, ctx) => ctx.enemy && ctx.enemy.iid === ci.host && ctx.damaged && g.isIdentity(ctx.damaged) && ctx.damageDealt > 0, run: async (g) => g.placeThreat(g.main(), 2) }] },
+  abilities: [{ kind: 'action', label: 'Gastar [energía][mental][físico] → descartar esta carta', heroOnly: true, cost: { types: { energy: 1, mental: 1, physical: 1 } }, run: async (g, ci) => g.discard(ci) }] });
+R('27149', { ...atV, grantKw: (g, src, tgt) => (g.inPlay(src) && tgt.iid === src.host ? { retaliate: 1 } : null), abilities: [{ kind: 'action', label: 'Sufrir 3 de daño indirecto → descartar esta carta', heroOnly: true, run: async (g, ci, p) => { await L.indirect(g, p, 3); await g.discard(ci); } }] });
+R('27150', { ...atV, on: { wouldTakeDamage: [{ cond: (g, ci, ctx) => ctx.target && ctx.target.iid === ci.host && ctx.attack && ctx.n > 0, run: async (g, ci, ctx) => { ctx.n -= 1; g.log('Escamas de neocarbono: −1 al daño del ataque.'); } }] },
+  abilities: [{ kind: 'action', label: 'Dar Duro y 1 potenciación bocabajo al villano → descartar esta carta', heroOnly: true, run: async (g, ci) => { const v = V(g); if (v) { await g.toughen(v); v.x.fdBoost = (v.x.fdBoost || 0) + 1; } await g.discard(ci); } }] });
+R('27151', { ...atV, abilities: [{ kind: 'action', label: 'El villano te ataca (si no sufres daño, descartar esta carta)', heroOnly: true, run: async (g, ci, p) => { const v = V(g); if (!v) return; const b = id(g, p).dmg; await g.enemyAttack(v, p); if (p.alive && id(g, p).dmg === b && g.inPlay(ci)) await g.discard(ci); } }] });
+R('27152', { ...atV, on: { enemyAttackInit: [{ cond: (g, ci, ctx) => ctx.enemy && ctx.enemy.iid === ci.host, run: async (g, ci, ctx) => { ctx.noDefend = true; } }] },
+  abilities: [{ kind: 'action', label: 'Agotar un personaje y descartar 1 carta al azar → descartar esta carta', heroOnly: true, cond: (g, ci, p) => g.friendlyCharacters(p).some((c) => !c.ex) && g.cards(g.pz(p, 'hand')).length > 0, run: async (g, ci, p) => {
+    const c = await g.pickOne('Agota un personaje', g.friendlyCharacters(p).filter((c) => !c.ex), { player: p.idx }); if (!c) return; c.ex = true; await g.randomDiscard(p, 1); await g.discard(ci); } }] });
+// Pesadilla personal
+const idSpecific = (g, c) => g.d(c).fac === 'hero';
+R('27153', { attachHost: attachToId, blankHost: true, abilities: [{ kind: 'action', label: 'Descartar 1 carta de identidad al azar → descartar esta carta', aeOnly: true, cond: (g, ci, p) => ci.host === id(g, p).iid && g.cards(g.pz(p, 'hand')).some((c) => idSpecific(g, c)),
+  run: async (g, ci, p) => { const l = g.cards(g.pz(p, 'hand')).filter((c) => idSpecific(g, c)); const c = l[Math.floor(Math.random() * l.length)]; g.put(c, g.pz(p, 'discard')); g.log(p.name + ' descarta ' + g.d(c).name + ' al azar.'); await g.discard(ci); } }] });
+R('27154', { stat: (g, src, tgt, s) => { if (tgt !== src || !g.inPlay(src) || (s !== 'sch' && s !== 'atk')) return 0; const q = g.engagedWith(src); return q ? g.cards(g.pz(q, 'hand')).filter((c) => idSpecific(g, c)).length : 0; },
+  boost: async (g, ci, ctx) => { const p = ctx.player; if (!p) return; await g.draw(p, 3); await g.randomDiscard(p, 3); } });
+R('27156', { whenRevealed: async (g, ci, p) => { const n = g.z(g.pz(p, 'hand')).length; if (n) await g.placeThreat(ci, n); } });
+R('27157', { whenRevealed: async (g, ci, p) => { const cs = await g.discardTop(p, g.z(g.pz(p, 'hand')).length); if (cs.some((c) => idSpecific(g, c))) await g.placeThreat(g.main(), 1); else await g.damage(id(g, p), 1, { source: g.d(ci).name }); } });
+// Asalto siniestro
+const sinisterHook = (fn) => ({ minionEntered: [{ cond: (g, ci, ctx) => ctx.card === ci && ctx.player, run: async (g, ci, ctx) => fn(g, ci, ctx.player) }], afterEnemyActivation: [{ cond: (g, ci, ctx) => ctx.enemy === ci && ctx.player && g.inPlay(ci), run: async (g, ci, ctx) => fn(g, ci, ctx.player) }] });
+R('27159', { on: sinisterHook(async (g, ci, p) => { const out = []; for (let k = 0; k < 60; k++) { const cs = await g.discardTop(p, 1); if (!cs.length) break; out.push(cs[0]); if (printed(g.d(cs[0]), 'energy') || printed(g.d(cs[0]), 'wild')) break; } }) });
+R('27161', { on: { afterEnemyAttack: [{ cond: (g, ci, ctx) => ctx.enemy === ci && ctx.player && ctx.damageDealt > 0, run: async (g, ci, ctx) => L.discardUpgradeOrSupport(g, ctx.player, ['upgrade', 'support'], 'Kraven: descarta una mejora o apoyo que controles') }] } });
+R('27162', { on: { afterEnemyAttack: [{ cond: (g, ci, ctx) => ctx.enemy === ci && ctx.damaged && ctx.damageDealt > 0 && g.inPlay(ctx.damaged), run: async (g, ci, ctx) => { const t = ctx.damaged; if (t.stun > 0) await g.damage(t, 2, { source: 'Escorpión' }); else await g.stun(t); } }] } });
+// Fuerza simbiótica
+R('27165', { attachHost: async (g) => V(g), on: { afterDamage: [{ cond: (g, ci, ctx) => ctx.target && ctx.target.iid === ci.host && ctx.attack && ctx.dealt > 0, run: async (g, ci, ctx) => {
+  const v = ctx.target; v.x.fdBoost = (v.x.fdBoost || 0) + 1; g.log(g.name(v) + ' recibe 1 carta de potenciación bocabajo.', 'bad');
+  if (ctx.dealt >= 3) await g.discard(ci);
+} }] } });
+R('27168', { whenRevealedAE: async (g, ci, p) => { if (p.heroes.length) await g.flip(p, { free: true, to: p.heroes[0] }); const v = V(g); if (v) await g.enemyAttack(v, p); },
+  whenRevealedHero: async (g, ci, p) => { const v = V(g); if (!v) return; v.x.fdBoost = (v.x.fdBoost || 0) + 1; await g.enemyAttack(v, p); } });
+R('27169', { whenRevealed: async (g) => { const v = V(g); if (v) { v.x.fdBoost = (v.x.fdBoost || 0) + 1; g.log(g.name(v) + ' recibe 1 carta de potenciación bocabajo.', 'bad'); } },
+  on: { boostIconsCount: [{ cond: (g, ci, ctx) => ctx.card === ci && ctx.attackCtx && ctx.attackCtx.attack, run: async (g, ci, ctx) => { ctx.icons += 2; ctx.attackCtx.overkill = true; } }] } });
+// Susurros de paranoia
+R('27170', { attachHost: attachToId, blockReady: (g, src, c) => { const h = g.C[src.host]; return !!h && c.ctrl === h.owner && (g.d(c).type === 'ally' || (g.d(c).type === 'support' && hasT(g, c, 'Persona'))); },
+  abilities: [{ kind: 'action', label: 'Descartar un aliado o apoyo Persona → descartar esta carta', aeOnly: true, cond: (g, ci, p) => ci.host === id(g, p).iid && g.controlled(p).some((c) => g.d(c).type === 'ally' || (g.d(c).type === 'support' && hasT(g, c, 'Persona'))),
+    run: async (g, ci, p) => { const c = await g.pickOne('Descarta un aliado o apoyo Persona', g.controlled(p).filter((c) => g.d(c).type === 'ally' || (g.d(c).type === 'support' && hasT(g, c, 'Persona'))), { player: p.idx }); if (c) { await g.discard(c); await g.discard(ci); } } }],
+  boost: async (g, ci, ctx) => { if (!ctx.attack || !ctx.player) return; (ctx.after = ctx.after || []).push(async (c) => { const d = c.defender; if (d && !c.heroDefended && !g.inPlay(d) && g.d(d).type === 'ally') await L.indirect(g, c.player, g.d(d).cost || 0); }); } });
+R('27171', { attachHost: async (g, ci, p) => {
+  const al = g.allies(p); if (!al.length) return 'surge';
+  const mn = Math.min(...al.map((a) => g.d(a).cost || 0)); const best = al.filter((a) => (g.d(a).cost || 0) === mn);
+  const a = best.length === 1 ? best[0] : await g.pickOne('Mente manipulada: elige el aliado de menor coste', best, { player: p.idx });
+  a.x.enthralled = true; a.ex = false; g.put(a, g.pz(p, 'eng')); g.log(g.d(a).name + ' pasa a ser un esbirro enfrentado a ' + p.name + '.', 'bad');
+  return a;
+} });
+R('27172', { attachHost: async () => null, stat: (g, src, tgt, s) => (s === 'hp' && g.inPlay(src) && tgt.iid === src.host ? 1 : 0), whenRevealed: async (g, ci, p, ctx) => {
+  const nm = g.cards(g.pz(p, 'nem')).concat(g.cards('enc.deck'), g.cards('enc.discard'), g.cards('aside')).find((c) => g.d(c).type === 'minion' && g.d(c).set === p.nemesisSet);
+  if (!nm) { g.log('No se encuentra el esbirro archienemigo.'); return; }
+  MC.shuffle(g.z('enc.deck'));
+  await g.reveal(nm, p);
+  if (g.inPlay(nm) && ci.zone === 'reveal') await g.attach(ci, nm);
+}, boost: async (g, ci, ctx) => { const p = ctx.player; if (!p) return; for (const c of g.friendlyCharacters(p).slice()) if (g.inPlay(c)) await g.damage(c, 1, { source: g.d(ci).name }); } });
+R('27173', { whenRevealed: async (g, ci, p) => {
+  const ns = g.cards(g.pz(p, 'nem')).concat(g.cards('enc.deck'), g.cards('enc.discard'), g.cards('aside')).find((c) => g.d(c).type === 'side_scheme' && g.d(c).set === p.nemesisSet);
+  if (!ns) { g.log('No se encuentra el plan secundario archienemigo.'); return; }
+  MC.shuffle(g.z('enc.deck'));
+  await g.reveal(ns, p);
+  if (g.inPlay(ns) && ns.thr) await g.placeThreat(ci, ns.thr);
+} });
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
 /* Mazos: héroes, precon automático, validación, importación desde MarvelCDB, escenarios. */
 (function (root) {
 'use strict';
@@ -8814,7 +10016,7 @@ function heroKit(set) {
   for (const c of D.cards) {
     if (c.set !== set || c.dup) continue;
     if (['hero', 'alter_ego', 'obligation'].includes(c.type) || c.fac === 'encounter') continue;
-    if (c.fac !== 'hero') continue;
+    if (c.fac !== 'hero' || root.MC.Game.identitySide(c.code)) continue;
     kit[c.code] = (kit[c.code] || 0) + (c.qty || 1);
   }
   return kit;
