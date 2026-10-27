@@ -682,6 +682,14 @@ b.hascard { text-decoration: underline dotted; text-underline-offset: 3px; }
   .topnav .brand { flex: 0 0 100%; margin: 2px 0 4px; }
   .topnav .navb { padding: 6px 9px; font-size: 13.5px; }
 }
+/* modo competitivo */
+.pvpbar { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; border-top: 1px dashed var(--line); padding-top: 6px; margin-top: 2px; }
+.pvprival { font-size: 13px; opacity: .9; }
+.pvpresult { flex-basis: 100%; font-size: 15px; }
+.pvplog { flex-basis: 100%; font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pvpteam.registration h3 { color: #6aa8ff; }
+.pvpteam.resistance h3 { color: #ff6a6a; }
+.ngmode { margin: 4px 0 12px; }
 
 /* Tema «cómic nocturno»: azul marino profundo, títulos amarillos con tipografía de cómic y acentos cian. */
 :root {
@@ -1558,6 +1566,7 @@ class Game {
     }
     for (const p of this.players) for (const code of p.obligations) this.mk(code, null, 'enc.deck');
     for (const code of cfg.extraEncounter || []) if (CARDS[code]) this.mk(code, null, 'enc.deck');
+    if (cfg.pvp && root.MC_PVP) root.MC_PVP.deckHook(this);
     shuffle(this.z('enc.deck'));
     this.cOut = { weapons: [], rescued: {}, usedTech: {}, prison: [], engaged: [], hp: {}, heroForm: {}, delay: 0 };
 
@@ -1596,6 +1605,7 @@ class Game {
     if (cfg.mainThreatBonus) { this.main().thr += cfg.mainThreatBonus; this.log('Campaña: +' + cfg.mainThreatBonus + ' de amenaza en el plan principal (contadores de retraso).', 'bad'); }
     for (const pi of cfg.dealExtra || []) if (this.players[pi]) await this.dealEncounter(this.players[pi]);
     if (cfg.campaign && root.MC_CAMPAIGN && root.MC_CAMPAIGN.hook) await root.MC_CAMPAIGN.hook(this, 'pre');
+    if (cfg.pvp && root.MC_PVP) await root.MC_PVP.hook(this, 'pre');
     // cartas que la identidad pone en juego o aparta antes de robar (formas de energía, forma de masa, Brillo mortal)
     for (const p of this.players) for (const code of [...p.aes, ...p.heroes]) { const pf = this.FX.get(code, this); if (pf.preSetup) await pf.preSetup(this, this.idOf(p), p); }
     // manos iniciales (paso 12 del reglamento)
@@ -13969,13 +13979,67 @@ const realBoost = (ctx, ci) => !!(ctx && ctx.boostCards && ctx.boostCards.includ
 const phaseKey = (g) => g.round + ':' + g.phase;
 const RES_ES = { mental: 'mental', energy: 'energía', physical: 'físico' };
 
-// «el equipo enemigo elige»: en cooperativo eligen los jugadores aplicando la regla sombría
+// modo competitivo (pvp.js se carga después: se consulta en tiempo de ejecución)
+const PV = () => root.MC_PVP;
+const pvp = (g) => !!(root.MC_PVP && root.MC_PVP.on(g));
+const enemySideEs = (g) => (pvp(g) ? PV().SIDE_ES[g.pvp.oppSide] : '');
+// rival automático (src/bot.js): decide sin preguntar, eligiendo lo peor para el equipo de esta mesa cuando es fácil de estimar
+const rivalBot = (g) => { if (!pvp(g)) return false; const o = PV().other(g); return !!(o && o.io && o.io.bot); };
+function badness(g, c) {
+  const d = g.d(c);
+  if (g.isIdentity(c)) return 50 + g.stat(c, 'atk') + g.stat(c, 'thw');
+  if (d.type === 'minion') return 3 * ((d.atk || 0) + (d.sch || 0)) + (d.hp || 0) + (d.boost || 0);
+  if (d.type === 'side_scheme') return (c.thr || 0) * 3 + (d.baseThreat || 0) + (d.hazard || 0) * 2 + (d.accel || 0) * 3;
+  if (['ally', 'upgrade', 'support'].includes(d.type)) return (d.cost || 0) * 3 + (d.atk || 0) + (d.thw || 0);
+  if (d.fac === 'encounter') return (d.boost || 0) + (d.boostStar ? 1 : 0);
+  return d.cost || 0;
+}
+function botPick(g, list, title) {
+  const sc = list.map((c) => ({ c, s: badness(g, c) + Math.random() * 0.5 }));
+  sc.sort((a, b) => b.s - a.s);
+  const c = sc[0].c;
+  const shown = g.inPlay(c) || !/^enc\./.test(c.zone || '');
+  g.log('El bot rival (' + enemySideEs(g) + ') elige ' + (shown ? g.name(c) : 'una carta') + (title ? ' — ' + title : '') + '.', 'bad');
+  return c;
+}
+// «el equipo enemigo elige»: en cooperativo eligen los jugadores aplicando la regla sombría; en competitivo elige el equipo rival
 async function grimPick(g, list, title) {
   list = list.filter(Boolean);
   if (!list.length) return null;
   if (list.length === 1) return list[0];
+  if (rivalBot(g)) return botPick(g, list, title);
+  if (pvp(g)) return g.pickOne('Elige el equipo enemigo (' + enemySideEs(g) + '): ' + title, list, { player: g.firstPlayer().idx });
   return g.pickOne(title + ' (regla sombría: elige como lo haría un oponente)', list, { player: g.firstPlayer().idx });
 }
+// decisiones del equipo enemigo que viven en pvp.js: con bot rival se eligen aquí sin preguntar
+async function stealMinion(g, p, title) {
+  if (!rivalBot(g)) return PV().stealEnemyMinion(g, p, title);
+  const x = PV().other(g); const l = x.minions(); if (!l.length) return null;
+  const sc = l.map((c) => ({ c, s: badness(x, c) + Math.random() * 0.5 })).sort((a, b) => b.s - a.s); const m = sc[0].c;
+  g.log('El bot rival (' + enemySideEs(g) + ') elige ' + x.name(m) + '.', 'bad');
+  const nc = g.mk(m.code, null, 'reveal'); nc.x.origin = x.pvp.side; nc.dmg = m.dmg || 0; nc.stun = m.stun || 0; nc.conf = m.conf || 0; nc.tough = m.tough || 0;
+  await x.removeFromGame(m); x.update();
+  await g.engageMinion(nc, p, { cancelWR: true });
+  g.log(g.name(nc) + ' cambia de mesa y se enfrenta a ' + p.name + '.', 'bad');
+  return nc;
+}
+async function discardLeaderAttachment(g, p, title) {
+  if (!rivalBot(g)) return PV().discardYourLeaderAttachment(g, p, title);
+  return PV().cross(g, async (x) => {
+    const Lc = x.villain(); const l = Lc ? x.attachments(Lc).filter((a) => !x.kw(a, 'permanent')) : [];
+    if (!l.length) return null;
+    const c = l[Math.floor(Math.random() * l.length)];
+    g.log('El bot rival (' + enemySideEs(g) + ') elige ' + x.name(c) + '.', 'bad');
+    await x.discard(c); g.log(x.name(c) + ' se descarta de tu líder.');
+    return c;
+  });
+}
+// «el líder enemigo ataca a tu líder (tras esta activación). No le des carta de potenciación.»
+const leaderHitsYourLeader = async (g, ctx, ci) => {
+  if (!pvp(g)) { g.log(g.d(ci).name + ': «tu líder» no existe en cooperativo; no se resuelve.'); return; }
+  const go = async () => { const v = V(g); if (v && g.inPlay(v)) await PV().attackYourLeader(g, v, { noBoost: true }); };
+  if (realBoost(ctx, ci)) g.later('afterEnemyActivation', go); else await go();
+};
 // «Encontrar» (pág. 9): en juego, apartadas, mazo y descarte de encuentros (no la zona de victoria, ni las retiradas, ni las bocabajo repartidas)
 function findCard(g, pred) {
   const inPlay = g.allInPlay().find((c) => !c.faceDown && pred(g.d(c), c));
@@ -14143,6 +14207,15 @@ RC('56072', { whenDefeated: async (g) => imAttach(g, true) });
 // ===================== PLANES PRINCIPALES (REGISTRO / RESISTENCIA) =====================
 // 1A (común): «En modo cooperativo, encuentra el plan secundario del líder elegido y muéstralo.»
 RC(['56063a', '56096a', '56121a', '56122a', '56141a', '56172a', '56199a', '56200a'], { setup: async (g) => {
+  if (pvp(g)) { // «En modo competitivo, el equipo enemigo encuentra Escoger un bando y tu equipo lo muestra.»
+    const cs = findCard(g, (d) => d.code === '56128a' || d.code === '56206a');
+    if (!cs) { g.log('No se encuentra Escoger un bando.'); return; }
+    if (cs.zone === 'enc.deck') MC.shuffle(g.z('enc.deck'));
+    g.resetCard(cs);
+    g.log('Preparación (competitivo): el equipo enemigo encuentra Escoger un bando y tu equipo lo muestra.', 'phase');
+    await g.reveal(cs, g.firstPlayer());
+    return;
+  }
   const vset = g.cfg.villainSet;
   const c = await g.searchEncounter((d) => d.set === vset && d.type === 'side_scheme', { discardToo: false });
   if (!c) { g.log('No se encuentra el plan secundario del líder.'); return; }
@@ -14156,7 +14229,8 @@ const treacheryThreat = { on: { encounterRevealed: [{ cond: (g, ci, ctx) => ci.z
   run: async (g, ci, ctx) => { g.setLimit('cw-cos:' + ci.code + ':' + ctx.player.idx, 'phase'); await g.placeThreat(ci, 1); } }] } };
 const minionsEach = async (g) => { // busca en el mazo de encuentros 1 esbirro por jugador y reparte uno a cada jugador
   for (const q of g.order()) {
-    const c = g.cards('enc.deck').find((x) => g.d(x).type === 'minion');
+    const l = g.cards('enc.deck').filter((x) => g.d(x).type === 'minion');
+    const c = pvp(g) ? await grimPick(g, l, 'un esbirro del mazo de encuentros para ' + q.name) : l[0];
     if (!c) { g.log('No quedan esbirros en el mazo de encuentros.'); break; }
     await dealCard(g, c, q);
   }
@@ -14165,7 +14239,9 @@ const minionsEach = async (g) => { // busca en el mazo de encuentros 1 esbirro p
 const sidesEach = async (g) => { // busca en el mazo y en el descarte 1 plan secundario por jugador y reparte uno a cada jugador
   for (const q of g.order()) {
     MC.shuffle(g.z('enc.deck'));
-    const c = g.cards('enc.deck').find((x) => g.d(x).type === 'side_scheme') || g.cards('enc.discard').slice().reverse().find((x) => g.d(x).type === 'side_scheme');
+    const l = [...g.cards('enc.deck'), ...g.cards('enc.discard')].filter((x) => g.d(x).type === 'side_scheme');
+    const c = pvp(g) ? await grimPick(g, l, 'un plan secundario para ' + q.name)
+      : g.cards('enc.deck').find((x) => g.d(x).type === 'side_scheme') || g.cards('enc.discard').slice().reverse().find((x) => g.d(x).type === 'side_scheme');
     if (!c) { g.log('No quedan planes secundarios en el mazo ni en el descarte de encuentros.'); break; }
     await dealCard(g, c, q);
   }
@@ -14242,6 +14318,11 @@ RC('56079', { whenRevealed: async (g, ci, p) => { const me = id(g, p); const was
   boost: async (g, ci, ctx) => { if (ctx.player && ctx.player.alive) await g.stun(id(g, ctx.player)); } });
 RC('56080', {
   whenRevealed: async (g, ci, p) => {
+    if (pvp(g)) { // el equipo enemigo vincula Alistado a un esbirro enfrentado con ellos y ese esbirro se enfrenta a ti
+      const nc = await stealMinion(g, p, 'Alistado — elige el equipo enemigo (' + enemySideEs(g) + '): un esbirro enfrentado con ellos');
+      if (nc) ci.x.draftee = nc.iid; else g.log('El equipo enemigo no tiene esbirros enfrentados: Alistado se descarta.');
+      return;
+    }
     const m = await g.discardUntil((d) => d.type === 'minion');
     if (!m) { g.log('No hay esbirros en el mazo de encuentros.'); return; }
     g.resetCard(m); ci.x.draftee = m.iid;
@@ -14251,6 +14332,14 @@ RC('56080', {
   attachHost: async (g, ci) => { const m = g.C[ci.x.draftee]; return m && g.inPlay(m) && g.isMinion(m) ? m : null; },
   stat: hostStat({ hp: 2 }),
   traits: (g, src, tgt) => (g.inPlay(src) && src.zone === 'attached' && tgt.iid === src.host ? ['Avenger'] : null),
+  // FAQ: el esbirro con Alistado derrotado vuelve al descarte del mazo de encuentros de su mesa de origen (Alistado, al de esta mesa)
+  on: { afterDefeated: [{ cond: (g, ci, ctx) => ci.zone === 'attached' && ctx.card && ctx.card.iid === ci.host && g.inPlay(ctx.card) && !!ctx.card.x.origin && pvp(g) && ctx.card.x.origin !== g.pvp.side,
+    run: async (g, ci, ctx) => {
+      const m = ctx.card; const code = m.code;
+      await g.removeFromGame(m);
+      await PV().cross(g, async (o) => { o.mk(code, null, 'enc.discard'); o.update(); });
+      g.log(g.d({ code }).name + ' vuelve al descarte de encuentros de la mesa de ' + enemySideEs(g) + '.');
+    } }] },
 });
 RC('56082', { whenDefeated: async (g) => {
   const cs = g.cards('enc.discard').filter((c) => g.d(c).type === 'minion' && avenger(g, c));
@@ -14278,8 +14367,14 @@ RC('56086', { whenDefeated: async (g, ci, ctx) => {
   for (const c of [...g.friendlyCharacters(p), ...g.minions(p)]) if (g.inPlay(c)) await g.damage(c, 1, { source: g.d(ci).name, byPlayer: p });
 } });
 // Dangerous Recruits
-RC('56087', { kw: { piercing: true }, whenRevealed: async (g, ci, p) => { g.log('Veneno no puede atacar a «tu líder» en cooperativo: se activa contra ti.'); await g.activate(ci, p); } });
-RC('56088', { whenRevealed: async (g, ci, p) => L.discardUpgradeOrSupport(g, p, ['upgrade'], 'Diana: descarta una mejora que controles') });
+RC('56087', { kw: { piercing: true }, whenRevealed: async (g, ci, p) => {
+  if (pvp(g) && PV().leaderOf(g)) { await PV().attackYourLeader(g, ci, { piercing: true }); return; }
+  g.log('Veneno no puede atacar a «tu líder» en cooperativo: se activa contra ti.'); await g.activate(ci, p);
+} });
+RC('56088', { whenRevealed: async (g, ci, p) => {
+  if (pvp(g) && await discardLeaderAttachment(g, p, 'Diana — elige el equipo enemigo (' + enemySideEs(g) + '): un accesorio de tu líder')) return;
+  await L.discardUpgradeOrSupport(g, p, ['upgrade'], 'Diana: descarta una mejora que controles');
+} });
 const eachMinionActivates = async (g, ci, p) => {
   const ms = g.minions();
   if (ms.length) { for (const m of ms) { const q = g.engagedWith(m); if (q && q.alive && g.inPlay(m)) await g.activate(m, q); } return; }
@@ -14287,7 +14382,7 @@ const eachMinionActivates = async (g, ci, p) => {
 };
 RC(['56089', '56187', '56192'], { whenRevealed: eachMinionActivates });
 RC('56090', { whenRevealed: async (g, ci, p, ctx) => { const n = g.minions().length; if (n) await g.placeThreat(g.main(), n); else ctxSurge(ctx); },
-  boost: async (g) => g.log('Fuerza excesiva: «tu líder» no existe en cooperativo; no se resuelve.') });
+  boost: async (g, ci, ctx) => leaderHitsYourLeader(g, ctx, ci) });
 RC('56091', { on: { afterDefeated: [{ cond: (g, ci, ctx) => ci.zone === 'side' && ctx.type === 'minion' && ctx.card && g.inPlay(ctx.card) && !ctx.card.drone && !!V(g),
   run: async (g, ci, ctx) => giveFdBoost(g, ctx.card) }] } });
 
@@ -14353,7 +14448,18 @@ RC('56098', { kw: { permanent: true }, attachHost: async (g) => V(g), on: { afte
     ci.ctr = 0; const v = g.C[ci.host];
     g.log('Canal de energía: se retiran los contadores → ' + g.name(v) + ' ataca a ' + g.name(ch) + ' (Exceso).', 'bad');
     await attackChar(g, v, ch, { overkill: true });
-  } }] } });
+  } }],
+  // competitivo (FAQ): el ataque de «tu líder» (desde la otra mesa) también cuenta, y Capitana Marvel contraataca a ese líder
+  wouldTakeDamage: [{ cond: (g, ci, ctx) => ci.zone === 'attached' && pvp(g) && ctx.target && ctx.target.iid === ci.host && ctx.attack && !ctx.attacker && !ctx.cwCounted
+      && !!PV().leaderOf(g) && ctx.source === 'ataque de ' + PV().other(g).name(PV().leaderOf(g)),
+    run: async (g, ci, ctx) => {
+      ctx.cwCounted = true;
+      ci.ctr = (ci.ctr || 0) + 1; g.log('Canal de energía: +1 contador (' + ci.ctr + ').'); g.update();
+      if (ci.ctr < 4) return;
+      ci.ctr = 0; const v = g.C[ci.host];
+      g.log('Canal de energía: se retiran los contadores → ' + g.name(v) + ' ataca a tu líder.', 'bad');
+      await PV().attackYourLeader(g, v);
+    } }] } });
 RC('56099', merge(afterBasicSame3(), { attachHost: async (g) => V(g), grantKw: hostKw({ stalwart: true }), boost: revealFromBoost }));
 RC('56100', { attachHost: async (g) => V(g), boost: revealFromBoost, on: { wouldTakeDamage: [{ cond: (g, ci, ctx) => ci.zone === 'attached' && ctx.target && ctx.target.iid === ci.host && ctx.attack && !ctx.prevented && ctx.n > 3,
   run: async (g, ci, ctx) => { g.log('Vuelo cósmico: el daño se reduce a 3.'); ctx.n = 3; await g.discard(ci); } }] } });
@@ -14371,7 +14477,7 @@ const righteous = async (g, ci, p) => {
   await g.enemyScheme(v, p);
 };
 RC(['56125', '56203'], { whenRevealed: righteous });
-RC(['56126', '56204'], { whenRevealedAE: async (g) => g.log('A cualquier precio: «tu líder» no existe en cooperativo; no se resuelve.'),
+RC(['56126', '56204'], { whenRevealedAE: async (g) => { if (pvp(g)) { const v = V(g); if (v) await PV().attackYourLeader(g, v); } else g.log('A cualquier precio: «tu líder» no existe en cooperativo; no se resuelve.'); },
   whenRevealedHero: async (g, ci, p) => { const v = V(g); if (v) await g.enemyAttack(v, p); } });
 const top5 = (g) => g.cards('enc.deck').slice(-5);
 RC(['56127', '56205'], { whenRevealed: async (g, ci, p) => { const c = await grimPick(g, top5(g).reverse(), 'Ataque selectivo: elige una de las 5 cartas superiores del mazo de encuentros para repartírtela'); if (c) await dealCard(g, c, p); MC.shuffle(g.z('enc.deck')); },
@@ -14390,7 +14496,8 @@ RC(['56128a', '56206a'], { kw: { permanent: true },
   } });
 RC(['56128b', '56206b'], { toPlayArea: true,
   whenRevealed: async (g, ci, p, ctx) => { g.log(g.d(ci).name + ' es el reverso de Escoger un bando: se retira de la partida.'); await g.removeFromGame(ci); ctxSurge(ctx); },
-  abilities: [{ kind: 'action', label: 'Retirar esta carta de la partida («tu líder» no existe en cooperativo)', cond: (g, ci, p) => ci.ctrl === p.idx, run: async (g, ci) => g.removeFromGame(ci) }] });
+  abilities: [{ kind: 'action', label: 'Retirar esta carta de la partida → cada jugador de tu equipo elige 2 cartas apartadas de tu líder', cond: (g, ci, p) => ci.ctrl === p.idx,
+    run: async (g, ci) => { await g.removeFromGame(ci); if (pvp(g)) await PV().earnLeaderCards(g); else g.log('«Tu líder» no existe en cooperativo: no hay cartas apartadas que ganar.'); } }] });
 
 // ===================== CAPITÁN AMÉRICA (LÍDER) =====================
 const CA_SET = 'captain_america_leader';
@@ -14454,7 +14561,23 @@ RC('56158', { whenRevealed: async (g, ci, p, ctx) => {
   const al = g.allies(p); if (!al.length) { ctxSurge(ctx); return; }
   const a = al.length === 1 ? al[0] : await g.pickOne('Cambiar de bando: descarta un aliado que controles', al, { player: p.idx });
   if (a) await g.discard(a);
-  if (!a || g.inPlay(a)) ctxSurge(ctx);
+  if (!a || g.inPlay(a)) { ctxSurge(ctx); return; }
+  // competitivo: cualquier jugador del equipo enemigo puede pagar su coste para ponerlo en juego bajo su control
+  if (pvp(g) && a.zone === g.pz(p, 'discard')) {
+    const cost = g.d(a).cost || 0; const code = a.code; const nm = g.d(a).name;
+    await PV().cross(g, async (o) => {
+      for (const q of o.alive()) {
+        if (!o.canAfford(q, { n: cost })) continue;
+        if (!(await o.confirm(q.name + ' (' + enemySideEs(g) + '): ¿pagar ' + cost + ' recurso(s) para poner en juego ' + nm + ' bajo tu control?'))) continue;
+        if (cost > 0 && !(await o.pay(q, { n: cost }, null, 'Cambiar de bando: paga ' + cost + ' por ' + nm))) continue;
+        g.put(a, 'removed');
+        const nc = o.mk(code, q.idx, null); nc.x.origin = g.pvp.side;
+        await o.enterPlay(nc, q, o.pz(q, 'play'));
+        o.log(q.name + ' pone en juego ' + nm + ' (cambia de bando).', 'good'); g.log(nm + ' cambia de bando: ahora lo controla ' + q.name + '.', 'bad');
+        o.update(); break;
+      }
+    });
+  }
 } });
 RC('56159', { whenDefeated: async (g) => { const c = await grimPick(g, top5(g).reverse(), 'Vengadores Secretos: elige una de las 5 cartas superiores para dársela al líder enemigo como potenciación'); if (c) await giveFdBoost(g, c); MC.shuffle(g.z('enc.deck')); } });
 // Namor / Atlanteans
@@ -14522,30 +14645,39 @@ const tangledHosts = (g) => g.cards('attached').filter((c) => c.code === '56181'
 RC('56180', { whenRevealed: async (g, ci, p) => {
   const hs = [...new Set(tangledHosts(g))];
   for (const h of hs) if (g.inPlay(ci) && g.inPlay(h)) await attackChar(g, ci, h);
-  if (hs.length) return;
+  let atkLeader = false;
+  if (pvp(g)) { const o = PV().other(g); const Lc = PV().leaderOf(g); if (o && Lc && o.attachments(Lc).some((a) => a.code === '56181') && g.inPlay(ci)) { atkLeader = true; await PV().attackYourLeader(g, ci); } }
+  if (hs.length || atkLeader) return;
   const c = g.cards('enc.deck').find((x) => x.code === '56181') || g.cards('enc.discard').slice().reverse().find((x) => x.code === '56181');
   MC.shuffle(g.z('enc.deck'));
   if (c) await dealCard(g, c, p);
 } });
-RC('56181', { attachHost: async (g, ci, p) => { if (p && p.alive && isHero(g, p)) return id(g, p); g.log('Enredado: no hay héroe al que vincularla (estás en forma de Alter ego); se descarta.'); return null; },
+RC('56181', { whenRevealed: async (g, ci) => { if (pvp(g) && PV().leaderOf(g)) await PV().attachToYourLeader(g, ci); },
+  attachHost: async (g, ci, p) => { if (p && p.alive && isHero(g, p)) return id(g, p); g.log('Enredado: no hay héroe al que vincularla (estás en forma de Alter ego); se descarta.'); return null; },
   boost: async (g, ci, ctx) => { if (inPlayCode(g, '56180')) await revealFromBoost(g, ci, ctx); },
   on: {
     heroAttackInit: [{ cond: (g, ci, ctx) => ci.zone === 'attached' && ctx.attacker && ctx.attacker.iid === ci.host && !ctx.cancel, run: async (g, ci, ctx) => { ctx.cancel = true; g.log('Enredado: en lugar de atacar, se descarta.'); await g.discard(ci); } }],
     thwartInit: [{ cond: (g, ci, ctx) => ci.zone === 'attached' && ctx.thwarter && ctx.thwarter.iid === ci.host && ctx.amount > 0, run: async (g, ci, ctx) => { ctx.amount = 0; g.log('Enredado: en lugar de desbaratar, se descarta.'); await g.discard(ci); } }],
-    enemySchemeInit: [{ cond: (g, ci, ctx) => ci.zone === 'attached' && ctx.enemy && ctx.enemy.iid === ci.host, run: async (g, ci, ctx) => { ctx.cancel = true; await g.discard(ci); } }],
+    enemySchemeInit: [{ cond: (g, ci, ctx) => ci.zone === 'attached' && ctx.enemy && ctx.enemy.iid === ci.host && !ctx.cancel, run: async (g, ci, ctx) => { ctx.cancel = true; g.log('Enredado: en lugar de maquinar, se descarta.'); await g.discard(ci); } }],
+    enemyAttackInit: [{ cond: (g, ci, ctx) => ci.zone === 'attached' && ctx.enemy && ctx.enemy.iid === ci.host && !ctx.cancel, run: async (g, ci, ctx) => { ctx.cancel = true; g.log('Enredado: en lugar de atacar, se descarta.'); await g.discard(ci); } }],
   } });
-RC('56182', { whenRevealed: async (g) => g.placeThreat(g.main(), 2) });
-RC('56183', { whenRevealed: async (g, ci) => g.placeThreat(ci, 2 * N(g)) });
+RC('56182', { whenRevealed: async (g) => { await g.placeThreat(g.main(), 2); if (pvp(g)) await PV().removeFromYourMain(g, 2); } });
+RC('56183', { whenRevealed: async (g, ci) => { if (pvp(g)) await PV().moveFromYourMain(g, 2, ci); else await g.placeThreat(ci, 2 * N(g)); } });
 // Defenders
-RC('56184', { whenRevealed: async (g, ci, p) => g.stun(id(g, p)), boost: async (g, ci, ctx) => { if (ctx.player && ctx.player.alive) await g.stun(id(g, ctx.player)); } });
-RC('56185', { whenRevealed: async (g, ci, p) => g.confuse(id(g, p)), boost: async (g, ci, ctx) => { if (ctx.player && ctx.player.alive) await g.confuse(id(g, ctx.player)); } });
+const leaderOr = (yourLeader, you) => async (g, p) => { if (pvp(g) && PV().leaderOf(g)) { await PV()[yourLeader](g); return; } if (p && p.alive) await g[you](id(g, p)); };
+const lukeFx = leaderOr('stunYourLeader', 'stun');
+const jessFx = leaderOr('confuseYourLeader', 'confuse');
+RC('56184', { whenRevealed: async (g, ci, p) => lukeFx(g, p), boost: async (g, ci, ctx) => lukeFx(g, ctx.player) });
+RC('56185', { whenRevealed: async (g, ci, p) => jessFx(g, p), boost: async (g, ci, ctx) => jessFx(g, ctx.player) });
 RC('56186', { whenRevealed: async (g, ci, p, ctx) => { const v = V(g); const was = !!v && v.tough > 0; if (v) await g.toughen(v); for (const m of g.minions()) await g.toughen(m); if (was) ctxSurge(ctx); } });
 RC('56188', guardAll);
 // Hell's Kitchen
 const exhaustOwn = async (g, p, grim) => { const l = g.friendlyCharacters(p).filter((c) => !c.ex && g.inPlay(c)); if (!l.length) return; const c = grim ? await grimPick(g, l, 'El equipo enemigo agota un personaje de ' + p.name) : l.length === 1 ? l[0] : await g.pickOne('Agota un personaje que controles', l, { player: p.idx }); if (c) { c.ex = true; g.log(g.name(c) + ' se agota.', 'bad'); g.update(); } };
 RC('56189', { whenRevealed: async (g, ci, p) => exhaustOwn(g, p, true), boost: async (g, ci, ctx) => { if (ctx.player && ctx.player.alive) await exhaustOwn(g, ctx.player, false); } });
-RC('56190', { whenRevealed: async (g, ci, p) => { g.log('Puño de Hierro no puede atacar a «tu líder» en cooperativo: se activa contra ti.'); await g.activate(ci, p); },
-  boost: async (g) => g.log('Puño de Hierro: «tu líder» no existe en cooperativo; no se resuelve.') });
+RC('56190', { whenRevealed: async (g, ci, p) => {
+  if (pvp(g) && PV().leaderOf(g)) { await PV().attackYourLeader(g, ci); return; }
+  g.log('Puño de Hierro no puede atacar a «tu líder» en cooperativo: se activa contra ti.'); await g.activate(ci, p);
+}, boost: async (g, ci, ctx) => leaderHitsYourLeader(g, ctx, ci) });
 RC('56191', { attachHost: async (g) => { const ms = g.minions(); if (!ms.length) return 'surge'; return grimPick(g, ms, 'Luchador de la resistencia: el equipo enemigo elige un esbirro'); },
   stat: hostStat({ hp: 4 }), grantKw: hostKw({ stalwart: true }),
   boost: async (g, ci, ctx) => { const p = ctx.player; if (!realBoost(ctx, ci) || !p) return; const ms = g.minions(p); if (!ms.length) return; const m = ms.length === 1 ? ms[0] : await g.pickOne('Luchador de la resistencia: elige un esbirro enfrentado contigo', ms, { player: p.idx }); if (m) { g.resetCard(ci); await g.attach(ci, m); } } });
@@ -14556,12 +14688,12 @@ const twinBoost = (twin, other) => async (g, ci, ctx) => {
   if (inPlayCode(g, twin)) { if (realBoost(ctx, ci)) { g.log(g.d({ code: twin }).name + ' está en juego: se muestra ' + g.d(ci).name + '.', 'bad'); await revealFromBoost(g, ci, ctx); } return; }
   await other(g, p);
 };
-RC('56194', { whenRevealed: async (g, ci, p) => scheme1(g, p, 2, 'Capa: coloca 2 de amenaza en un plan'),
+RC('56194', { whenRevealed: async (g, ci, p) => { await scheme1(g, p, 2, 'Capa: coloca 2 de amenaza en un plan'); if (pvp(g)) await PV().removeFromYourMain(g, 2); },
   boost: twinBoost('56195', async (g, p) => scheme1(g, p, 1, 'Capa: coloca 1 de amenaza en un plan')) });
 RC('56195', { whenRevealed: async (g, ci, p) => { const v = V(g); if (v) await g.heal(v, 2); await dmgOwnChar(g, p, 2, g.d(ci).name); },
   boost: twinBoost('56194', async (g, p) => dmgOwnChar(g, p, 1, 'Daga')) });
 RC('56196', { attachHost: async (g) => V(g), enter: async (g, ci) => { const h = g.C[ci.host]; if (h) await g.toughen(h); },
-  on: { afterEnemyScheme: [{ cond: (g, ci, ctx) => ci.zone === 'attached' && ctx.enemy && ctx.enemy.iid === ci.host && ctx.placed > 0, run: async (g, ci) => { g.log('Fuerza oscura: «tu líder» no existe en cooperativo; se descarta.'); await g.discard(ci); } }] } });
+  on: { afterEnemyScheme: [{ cond: (g, ci, ctx) => ci.zone === 'attached' && ctx.enemy && ctx.enemy.iid === ci.host && ctx.placed > 0, run: async (g, ci, ctx) => { if (pvp(g)) await PV().removeFromYourMain(g, ctx.placed); else g.log('Fuerza oscura: «tu líder» no existe en cooperativo; se descarta.'); await g.discard(ci); } }] } });
 RC('56197', { whenRevealed: async (g, ci, p) => { const v = V(g); if (v) await g.heal(v, 3); await L.indirect(g, p, 3); } });
 RC('56198', { whenDefeated: async (g) => { const v = V(g); if (!v) return; await g.heal(v, 3); await g.toughen(v); } });
 root.MC_CW_SCRIPTS = { findCard, attachEnc, giveFdBoost, attackChar, shieldOnCA, finesse, echan };
@@ -15825,6 +15957,349 @@ root.MC_AOS = {
   addEncounterSets: (g, sets, o = {}) => { for (const s of sets || []) for (const c of MC.D.cards.filter((x) => x.set === s && !x.dup && !x.hidden && !(o.except || []).includes(x.code))) for (let k = 0; k < (c.qty || 1); k++) g.mk(c.code, null, 'enc.deck'); MC.shuffle(g.z('enc.deck')); },
   helpers: { findCard, engageTo, attackAlly, tuck, addAccTok },
 };
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* Civil War — modo competitivo (Registro contra Resistencia).
+   Cada equipo juega su propia partida (MC.Game) contra el líder y el escenario que preparó el equipo rival.
+   El Match intercala las fases: héroes de Registro → héroes de Resistencia → villano de Registro → villano de Resistencia.
+   Los efectos que cruzan de una mesa a otra («tu líder», «el equipo enemigo») usan las funciones de MC_PVP. */
+(function (root) {
+'use strict';
+const MC = root.MC;
+const FX = root.MC_FX;
+const GameOver = MC.GameOver;
+const CW = () => root.MC_CW;
+const SIDE_ES = { registration: 'Registro', resistance: 'Resistencia' };
+const PVP_COPY = { registration: ['56125', '56126', '56127', '56128a', '56128b'], resistance: ['56203', '56204', '56205', '56206a', '56206b'] };
+
+// ---------- consultas ----------
+const on = (g) => !!(g && g.pvp && g.pvp.match);
+const other = (g) => (on(g) ? g.pvp.other() : null);
+const leaderOf = (g) => { const o = other(g); return o ? o.villain() : null; }; // «tu líder»: el que tu equipo trajo (está en la mesa rival)
+const leaderMain = (g) => { const o = other(g); return o ? o.main() : null; };
+const enemyTeam = (g) => { const o = other(g); return o ? o.players.filter((p) => p.alive) : []; };
+const gameOf = (g, c) => { if (!c) return null; if (g.C[c.iid] === c) return g; const o = other(g); return o && o.C[c.iid] === c ? o : null; };
+// ejecuta algo en la otra mesa capturando su posible fin de partida (no detiene la mesa actual)
+async function cross(g, fn) {
+  const o = other(g); if (!o || o.over) return null;
+  try { return await fn(o); } catch (e) { if (e instanceof GameOver) { o.finish(e.win, e.message); g.log('En la mesa de ' + SIDE_ES[o.pvp.side] + ': ' + e.message, e.win ? 'bad' : 'good'); return null; } throw e; }
+}
+// iconos de una carta de potenciación del mazo de encuentros de la mesa x (se descarta)
+function boostFrom(x, n = 1) {
+  let icons = 0; const names = [];
+  for (let k = 0; k < n; k++) {
+    if (!x.z('enc.deck').length) { const d = x.z('enc.discard'); if (!d.length) break; for (const i of d.splice(0)) x.z('enc.deck').push(i); MC.shuffle(x.z('enc.deck')); for (const i of x.z('enc.deck')) x.C[i].zone = 'enc.deck'; }
+    const c = x.top('enc.deck'); if (!c) break;
+    x.put(c, 'enc.discard'); icons += x.boostIcons(c); names.push(x.d(c).name);
+  }
+  return { icons, names };
+}
+
+// ---------- líder contra líder ----------
+// un enemigo de la mesa g ataca a «tu líder» (que está en la otra mesa). No hay defensores ni Guardia.
+async function attackYourLeader(g, enemy, o = {}) {
+  const Lc = leaderOf(g); if (!Lc || !enemy) return null;
+  let atk = g.stat(enemy, 'atk') + (o.bonus || 0);
+  let b = { icons: 0, names: [] };
+  if (!o.noBoost) { b = boostFrom(g, 1 + ((enemy.x && enemy.x.fdBoost) || 0)); if (enemy.x) enemy.x.fdBoost = 0; }
+  let dmg = atk + b.icons;
+  if (o.cap != null && dmg > o.cap) dmg = o.cap;
+  g.log(g.name(enemy) + ' ataca a tu líder (' + g.name(Lc) + ')' + (b.names.length ? ' con potenciación ' + b.names.join(', ') + ' (+' + b.icons + ')' : '') + ': ' + dmg + ' de daño.', 'play');
+  await cross(g, async (x) => { await x.damage(Lc, dmg, { attack: true, source: 'ataque de ' + g.name(enemy) + ' (otra mesa)', piercing: o.piercing }); x.update(); });
+  const r = Lc && g.pvp.other().kw(Lc, 'retaliate');
+  if (r && g.inPlay(enemy)) await g.damage(enemy, r, { source: 'represalia de ' + g.name(Lc) });
+  g.update();
+  return dmg;
+}
+// «tu líder» ataca al líder enemigo (el villano de la mesa g)
+async function yourLeaderAttacks(g, p, o = {}) {
+  const Lc = leaderOf(g); const t = g.villain(); if (!Lc || !t) return null;
+  const x = other(g);
+  let atk = x.stat(Lc, 'atk') + (o.bonus || 0);
+  const fin = x.attachments(Lc).find((a) => a.code === '56174');
+  if (fin && fin.ctr > 0) { atk += fin.ctr; g.log('Sutileza: +' + fin.ctr + ' ATQ.'); fin.ctr = 0; x.update(); }
+  let b = { icons: 0, names: [] };
+  if (!o.noBoost) { b = boostFrom(x, 1 + ((Lc.x && Lc.x.fdBoost) || 0)); if (Lc.x) Lc.x.fdBoost = 0; }
+  const dmg = atk + b.icons;
+  g.log(x.name(Lc) + ' (tu líder) ataca a ' + g.name(t) + (b.names.length ? ' con potenciación ' + b.names.join(', ') + ' (+' + b.icons + ')' : '') + ': ' + dmg + ' de daño.', 'play');
+  await g.damage(t, dmg, { attack: true, byPlayer: p, source: 'ataque de ' + x.name(Lc) });
+  const r = g.kw(t, 'retaliate');
+  if (r) await cross(g, async (y) => y.damage(Lc, r, { source: 'represalia de ' + g.name(t) }));
+  return dmg;
+}
+// «tu líder» maquina: amenaza en su plan principal (en la otra mesa)
+async function yourLeaderSchemes(g, o = {}) {
+  const Lc = leaderOf(g); if (!Lc) return 0;
+  const x = other(g); let n = x.stat(Lc, 'sch') + (o.bonus || 0);
+  if (!o.noBoost) { const b = boostFrom(x, 1); n += b.icons; }
+  g.log(x.name(Lc) + ' (tu líder) maquina: ' + n + ' de amenaza en su plan principal.', 'play');
+  await cross(g, async (y) => { await y.placeThreat(y.main(), n); y.update(); });
+  return n;
+}
+const stunYourLeader = (g) => cross(g, async (x) => { const Lc = x.villain(); if (Lc) await x.stun(Lc); });
+const confuseYourLeader = (g) => cross(g, async (x) => { const Lc = x.villain(); if (Lc) await x.confuse(Lc); });
+const toughenYourLeader = (g) => cross(g, async (x) => { const Lc = x.villain(); if (Lc) await x.toughen(Lc); });
+const removeFromYourMain = (g, n) => cross(g, async (x) => { const m = x.main(); if (!m || n <= 0) return 0; const k = await x.removeThreat(m, n); g.log('Se retiran ' + (k || 0) + ' de amenaza del plan principal de tu líder.', 'good'); return k || 0; });
+async function moveFromYourMain(g, n, to) {
+  const k = (await removeFromYourMain(g, n)) || 0;
+  if (k && to && g.inPlay(to)) await g.placeThreat(to, k);
+  return k;
+}
+// vincula a «tu líder» una carta de encuentro de esta mesa (se crea en la otra mesa; al salir de juego se retira)
+async function attachToYourLeader(g, ci) {
+  const x = other(g); const Lc = leaderOf(g); if (!x || !Lc) return null;
+  const c = x.mk(ci.code, null, 'reveal'); c.x.foreign = true;
+  await g.removeFromGame(ci);
+  await cross(g, async (y) => y.attach(c, Lc));
+  g.log(g.d(ci).name + ' se vincula a tu líder (' + x.name(Lc) + ').');
+  return c;
+}
+async function discardYourLeaderAttachment(g, p, title) {
+  return cross(g, async (x) => {
+    const Lc = x.villain(); const l = Lc ? x.attachments(Lc).filter((a) => !x.kw(a, 'permanent')) : [];
+    if (!l.length) return null;
+    const c = l.length === 1 ? l[0] : await g.pickOne(title || 'Descarta un accesorio de tu líder', l, { player: (p || g.firstPlayer()).idx });
+    if (c) { await x.discard(c); g.log(x.name(c) + ' se descarta de tu líder.'); }
+    return c;
+  });
+}
+// mueve un esbirro enfrentado con el equipo enemigo (otra mesa) para que se enfrente a p en esta mesa
+async function stealEnemyMinion(g, p, title) {
+  const x = other(g); if (!x) return null;
+  const l = x.minions(); if (!l.length) return null;
+  const m = l.length === 1 ? l[0] : await g.pickOne(title || 'Elige un esbirro enfrentado con el equipo enemigo', l, { player: p.idx });
+  if (!m) return null;
+  const nc = g.mk(m.code, null, 'reveal'); nc.x.origin = x.pvp.side; nc.dmg = m.dmg || 0; nc.stun = m.stun || 0; nc.conf = m.conf || 0; nc.tough = m.tough || 0;
+  await x.removeFromGame(m); x.update();
+  await g.engageMinion(nc, p, { cancelWR: true });
+  g.log(g.name(nc) + ' cambia de mesa y se enfrenta a ' + p.name + '.', 'bad');
+  return nc;
+}
+
+// ---------- cartas de jugador de los líderes ----------
+const CWL = FX.cwLeader = FX.cwLeader || {};
+const dflt = { ...CWL };
+CWL.of = (g, p, set) => { if (!on(g)) return dflt.of ? dflt.of(g, p, set) : null; const Lc = leaderOf(g); if (!Lc || (set && other(g).d(Lc).set !== set)) return null; return Lc; };
+CWL.toughen = async (g, Lc) => { if (!on(g) || gameOf(g, Lc) === g) return dflt.toughen(g, Lc); return cross(g, async (x) => x.toughen(Lc)); };
+CWL.hurt = async (g, Lc, n, o = {}) => { if (!on(g) || gameOf(g, Lc) === g) return dflt.hurt(g, Lc, n, o); return cross(g, async (x) => x.damage(Lc, n, o)); };
+CWL.attack = async (g, p, Lc, card) => { if (!on(g)) return dflt.attack(g, p, Lc, card); return yourLeaderAttacks(g, p, { card }); };
+CWL.scheme = async (g, p, Lc, o = {}) => { if (!on(g)) return dflt.scheme(g, p, Lc, o); return yourLeaderSchemes(g, o); };
+CWL.attackedBy = async (g, enemy, p, Lc, cap) => { if (!on(g)) return dflt.attackedBy(g, enemy, p, Lc, cap); return attackYourLeader(g, enemy, { cap }); };
+
+// ---------- preparación de cada mesa ----------
+async function hook(g, when) {
+  const P = g.cfg.pvp; if (!P) return;
+  if (when === 'pre') {
+    // cartas básicas del líder de este equipo, apartadas
+    for (const c of MC.D.cards.filter((x) => x.set === P.leaderSet && x.fac === 'basic' && !x.dup)) for (let k = 0; k < (c.qty || 1); k++) g.mk(c.code, null, 'pvp.aside');
+    g.log('Modo competitivo: tu equipo (' + SIDE_ES[P.side] + ') se enfrenta al líder del equipo de ' + SIDE_ES[P.oppSide] + '.', 'phase');
+  }
+}
+// una sola copia del set Normal JcJ y sin reversos (se llama al construir el mazo de encuentros)
+function deckHook(g) {
+  const P = g.cfg.pvp; if (!P) return;
+  const keep = PVP_COPY[P.oppSide] || PVP_COPY.registration;
+  const drop = [...PVP_COPY.registration, ...PVP_COPY.resistance].filter((c) => !keep.includes(c) || /b$/.test(c));
+  for (const c of g.cards('enc.deck').filter((x) => drop.includes(x.code))) g.put(c, 'removed');
+}
+// cartas apartadas que el equipo gana con «Ahora es personal»
+async function earnLeaderCards(g) {
+  for (const p of g.order()) {
+    const l = g.cards('pvp.aside'); if (!l.length) break;
+    const sel = l.length <= 2 ? l : await g.askCards(p.name + ': elige 2 cartas de tu líder para añadirlas a tu mano', l, { min: Math.min(2, l.length), max: 2, player: p.idx, always: true }).then((ids) => ids.map((i) => (typeof i === 'object' ? i : g.C[i])));
+    for (const c of sel) { if (!c) continue; c.owner = p.idx; g.put(c, g.pz(p, 'hand')); g.log(p.name + ' añade ' + g.d(c).name + ' a su mano (carta de su líder).', 'good'); }
+  }
+  g.update();
+}
+function refresh(g) {
+  const o = other(g); if (!o) return;
+  for (const p of g.players) {
+    if (Object.getOwnPropertyDescriptor(p, 'enemyTeam') && !Object.getOwnPropertyDescriptor(p, 'enemyTeam').get) delete p.enemyTeam;
+    if (p._pvpRefs) continue;
+    // no enumerables: así no entran en las instantáneas (deshacer / guardar)
+    Object.defineProperty(p, '_pvpRefs', { value: true, enumerable: false });
+    Object.defineProperty(p, 'leader', { get: () => o.villain() || null, enumerable: false, configurable: true });
+    Object.defineProperty(p, 'leaderMain', { get: () => o.main() || null, enumerable: false, configurable: true });
+    Object.defineProperty(p, 'enemyTeam', { get: () => o.players, enumerable: false, configurable: true });
+  }
+}
+
+// ---------- desempate (pág. 17) ----------
+function tieStats(g) {
+  const ids = g.players.map((p) => g.idOf(p)).filter(Boolean);
+  const v = g.villain();
+  return [
+    g.mIdx === 0 ? 1 : 0, // el plan enemigo no pasó de 1B
+    -(g.minions().length + g.sideSchemes().length),
+    -((g.main() && g.main().thr) || 0),
+    g.players.reduce((s, p) => s + (p.alive ? Math.max(0, g.hpLeft(g.idOf(p))) : 0), 0) + 0 * ids.length,
+    -(v ? g.attachments(v).length : 0),
+  ];
+}
+const TIE_ES = ['el plan principal enemigo no pasó de la etapa 1B', 'menos esbirros y planes secundarios en su zona', 'menos amenaza en el plan principal de su zona', 'más vida restante en sus identidades', 'menos accesorios en el líder de su zona'];
+
+// ---------- la partida competitiva ----------
+class Match {
+  constructor(o) {
+    // o = { registration: {players, leader, mains, modulars}, resistance: {...}, expert, ioFor(side, game) }
+    this.o = o; this.round = 1; this.phaseNo = 0; this.result = null; this.listeners = [];
+    const mk = (side) => {
+      const opp = side === 'registration' ? 'resistance' : 'registration';
+      const me = o[side], them = o[opp];
+      const cfg = { players: me.players, villainSet: them.leader, mainStages: CW().stagesFor(them.mains), modulars: them.modulars.slice(), expert: !!o.expert,
+        villainStages: null, standardSets: ['standard_pvp'], expertSets: ['expert'], pause: {}, pvp: { side, oppSide: opp, leaderSet: me.leader } };
+      const g = new MC.Game(cfg, o.ioFor(side));
+      g.pvp = { side, oppSide: opp, match: this, other: () => this.games[opp] };
+      return g;
+    };
+    this.games = { registration: mk('registration'), resistance: mk('resistance') };
+    this.games.registration.pvp.match = this; this.games.resistance.pvp.match = this;
+  }
+  get reg() { return this.games.registration; }
+  get res() { return this.games.resistance; }
+  async phase(g, kind) {
+    if (g.over) return;
+    refresh(g); refresh(g.pvp.other());
+    this.current = { side: g.pvp.side, kind };
+    for (const f of this.listeners) f('phase', { side: g.pvp.side, kind, round: this.round, game: g });
+    try {
+      if (kind === 'setup') await g.setup();
+      else if (kind === 'player') await g.playerPhase();
+      else await g.villainPhase();
+    } catch (e) {
+      if (e instanceof GameOver) g.finish(e.win, e.message);
+      else { console.error(e); g.log('Error del motor: ' + e.message, 'error'); throw e; }
+    }
+    g.round = this.round;
+  }
+  outcome() {
+    const R = this.reg.over, S = this.res.over;
+    if (!R && !S) return null;
+    const rGood = (R && R.win) || (S && !S.win);
+    const sGood = (S && S.win) || (R && !R.win);
+    if (rGood && !sGood) return { winner: 'registration', why: R && R.win ? 'Registro derrotó al líder enemigo.' : 'El líder del Registro cumplió su objetivo contra la Resistencia (' + (S ? S.msg : '') + ').' };
+    if (sGood && !rGood) return { winner: 'resistance', why: S && S.win ? 'La Resistencia derrotó al líder enemigo.' : 'El líder de la Resistencia cumplió su objetivo contra el Registro (' + (R ? R.msg : '') + ').' };
+    if (R && S && !R.win && !S.win) return { winner: null, both: 'lose', why: 'Los dos equipos han perdido.' };
+    // empate: los dos derrotaron a su líder enemigo
+    const a = tieStats(this.reg), b = tieStats(this.res);
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) { const w = a[i] > b[i] ? 'registration' : 'resistance'; return { winner: w, tie: true, why: 'Empate a victorias: gana ' + SIDE_ES[w] + ' por desempate (' + TIE_ES[i] + ').' }; }
+    return { winner: null, tie: true, why: 'Empate perfecto.' };
+  }
+  async run() {
+    for (const f of this.listeners) f('start', {});
+    await this.phase(this.reg, 'setup');
+    await this.phase(this.res, 'setup');
+    let out = this.outcome();
+    while (!out && this.round < 60) {
+      for (const kind of ['player', 'villain']) {
+        await this.phase(this.reg, kind);
+        await this.phase(this.res, kind);
+        out = this.outcome();
+        if (out) break;
+      }
+      if (!out) { this.round++; this.reg.round = this.round; this.res.round = this.round; }
+    }
+    this.result = out || { winner: null, why: 'Límite de rondas.' };
+    for (const f of this.listeners) f('end', this.result);
+    return this.result;
+  }
+}
+
+root.MC_PVP = { Match, SIDE_ES, on, other, leaderOf, leaderMain, enemyTeam, cross, boostFrom, attackYourLeader, yourLeaderAttacks, yourLeaderSchemes,
+  stunYourLeader, confuseYourLeader, toughenYourLeader, removeFromYourMain, moveFromYourMain, attachToYourLeader, discardYourLeaderAttachment, stealEnemyMinion,
+  earnLeaderCards, hook, deckHook, refresh, tieStats };
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
+/* Rival automático (bot) para el modo competitivo: decide sin interfaz con reglas sencillas. */
+(function (root) {
+'use strict';
+const MC = root.MC;
+const rnd = (n) => Math.floor(Math.random() * n);
+const pick = (a) => a[rnd(a.length)];
+function makeIO(opts = {}) {
+  const logs = [];
+  const io = {
+    bot: true,
+    logs,
+    log: (m, k) => { logs.push({ m, k }); if (logs.length > 400) logs.shift(); if (opts.onLog) opts.onLog(m, k); },
+    update: () => { if (opts.onUpdate) opts.onUpdate(); },
+    async ask(q) {
+      const o = q.options || [];
+      const real = o.filter((x) => x.value !== null && x.value !== 'pause');
+      if (/Quién defiende/.test(q.title || '')) {
+        const g = opts.game && opts.game();
+        const hero = o.find((x) => x.value === 'hero');
+        const ally = o.find((x) => x.value && x.value !== 'hero' && x.value !== 'none');
+        if (g && hero) { const p = g.players[q.player] || g.players[0]; const me = g.idOf(p); if (g.hpLeft(me) > 6) return 'hero'; }
+        if (ally) return ally.value;
+        return hero ? 'hero' : (o.find((x) => x.value === 'none') || o[0]).value;
+      }
+      if (q.window) return Math.random() < 0.6 && real.length ? real[0].value : null; // respuestas: suele usarlas
+      if (/mulligan/i.test(q.title || '')) return null;
+      if (!real.length) return (o[0] || {}).value;
+      const yes = real.find((x) => x.value === true); if (yes && Math.random() < 0.7) return yes.value;
+      return pick(real).value;
+    },
+    async askCards(q) {
+      if (/mulligan|descarta las cartas que quieras/i.test(q.title || '')) return [];
+      const ids = q.iids.slice().sort(() => Math.random() - 0.5);
+      return ids.slice(0, Math.max(q.min, Math.min(q.max, q.min || 1)));
+    },
+    async pay(q) {
+      const sel = { cards: [], sources: [] };
+      const tot = { mental: 0, energy: 0, physical: 0, wild: 0 };
+      for (const s of q.sources) { if (q.satisfies(tot, q.req)) break; sel.sources.push(s.id); MC.addRes(tot, s.res); }
+      // paga primero con recursos y cartas caras que no se pueden jugar
+      const g = opts.game && opts.game();
+      const cards = q.cards.slice().sort((a, b) => {
+        const da = g ? g.d(g.C[a.iid] || {}) : {}, db = g ? g.d(g.C[b.iid] || {}) : {};
+        return (db.type === 'resource') - (da.type === 'resource') || (db.cost || 0) - (da.cost || 0);
+      });
+      for (const c of cards) { if (q.satisfies(tot, q.req)) break; sel.cards.push(c.iid); MC.addRes(tot, c.res); }
+      return q.satisfies(tot, q.req) ? sel : null;
+    },
+    async manual() {},
+    async revealed() {},
+    async playerTurn(p, g) {
+      const typeRank = { ally: 0, upgrade: 1, support: 1, event: 2 };
+      for (let k = 0; k < 14 && !g.over && p.alive; k++) {
+        const me = g.idOf(p);
+        const hero = g.isHeroForm(p);
+        if (hero && g.hpLeft(me) <= 4 && g.canFlip(p)) { await g.act(() => g.flip(p)); continue; }
+        if (!hero && g.hpLeft(me) <= Math.ceil(g.maxHp(me) / 2) && g.canBasic(p, 'recover')) { await g.act(() => g.basicRecover(p)); continue; }
+        if (!hero && g.canFlip(p) && g.hpLeft(me) > 5) { await g.act(() => g.flip(p)); continue; }
+        // cartas jugables (aliados y mejoras antes que eventos)
+        const hand = g.cards(g.pz(p, 'hand')).filter((c) => g.d(c).type !== 'resource' && g.playableNow(p, c).ok);
+        hand.sort((a, b) => (typeRank[g.d(a).type] ?? 3) - (typeRank[g.d(b).type] ?? 3) || (g.d(b).cost || 0) - (g.d(a).cost || 0));
+        if (hand.length && Math.random() < 0.85) { const before = g.z(g.pz(p, 'hand')).length; await g.act(() => g.playCard(p, hand[0])); if (g.z(g.pz(p, 'hand')).length !== before) continue; }
+        const m = g.main();
+        const danger = m && g.threshold(m) && m.thr >= g.threshold(m) * 0.55;
+        if (danger && g.canBasic(p, 'thwart')) { await g.act(() => g.basicThwart(p)); continue; }
+        if (g.canBasic(p, 'attack')) { await g.act(() => g.basicAttack(p)); continue; }
+        if (g.canBasic(p, 'thwart')) { await g.act(() => g.basicThwart(p)); continue; }
+        let did = false;
+        for (const a of g.allies(p)) {
+          if (danger && g.canAllyAct(p, a, 'thwart')) { await g.act(() => g.allyThwart(p, a)); did = true; break; }
+          if (g.canAllyAct(p, a, 'attack')) { await g.act(() => g.allyAttack(p, a)); did = true; break; }
+          if (g.canAllyAct(p, a, 'thwart')) { await g.act(() => g.allyThwart(p, a)); did = true; break; }
+        }
+        if (did) continue;
+        const abs = [];
+        for (const c of g.controlled(p)) for (const ab of g.abilitiesOf(p, c)) if (!ab.manual && g.abilityUsable(p, c, ab)) abs.push(() => g.useAbility(p, c, ab));
+        if (abs.length && Math.random() < 0.7) { await g.act(pick(abs)); continue; }
+        if (g.canBasic(p, 'recover') && g.hpLeft(me) < g.maxHp(me)) { await g.act(() => g.basicRecover(p)); continue; }
+        break;
+      }
+    },
+    gameOver() {},
+  };
+  return io;
+}
+root.MC_BOT = { makeIO };
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
@@ -17823,8 +18298,11 @@ function renderNewGame() {
   const defStages = (() => { const ov = FX.stageOverride && FX.stageOverride[v.set]; if (ov) return ov(st.expert); const nums = v.stages.filter((s) => roman[s.stage]).sort((a, b) => roman[a.stage] - roman[b.stage]); if (nums.length >= 3) return (st.expert ? nums.slice(1, 3) : nums.slice(0, 2)).map((s) => s.code); return v.stages.map((s) => s.code); })();
   const stages = st.stages || defStages;
   if (!ds.length) return h('main', { class: 'page' }, h('h2', {}, 'Nueva partida'), h('p', {}, 'Primero crea un mazo.'), h('button', { class: 'btn primary', onclick: () => setScreen('decks') }, 'Ir a mazos'));
+  const modeTabs = h('div', { class: 'tabs3 ngmode', style: { maxWidth: '520px' } },
+    [['coop', 'Cooperativo'], ['pvp', '⚔ Competitivo (Civil War)']].map(([k, l]) => h('button', { class: (UI.ngMode || 'coop') === k ? 'on' : '', onclick: () => { UI.ngMode = k; render(); } }, l)));
+  if (UI.ngMode === 'pvp') return renderPvpSetup(ds, modeTabs);
   return h('main', { class: 'page newgame' },
-    h('h2', {}, 'Nueva partida'),
+    h('h2', {}, 'Nueva partida'), modeTabs,
     h('div', { class: 'grid2' },
       h('section', { class: 'panel' }, h('h3', {}, 'Jugadores (' + st.decks.length + ')'),
         st.decks.map((id, i) => h('div', { class: 'row gap' },
@@ -17863,6 +18341,117 @@ function renderNewGame() {
           iconImg(m.set), h('span', {}, m.name), st.modulars.includes(m.set) ? h('i', { class: 'vcheck' }, '✓') : null))))),
     h('div', { class: 'row gap' },
       h('button', { class: 'btn big primary', onclick: () => startGame({ st, stages }) }, '¡A jugar!')));
+}
+// ======================= MODO COMPETITIVO (Civil War) =======================
+const PVP_LEADERS = { registration: ['iron_man_leader', 'captain_marvel_leader'], resistance: ['captain_america_leader', 'spider_woman_leader'] };
+function pvpTeamDefault(side, ds) {
+  const leader = PVP_LEADERS[side][0];
+  return { ctrl: side === 'registration' ? 'human' : 'bot', decks: [ds[side === 'registration' ? 0 : Math.min(1, ds.length - 1)].id], leader, mains: MC_CW.LEADERS[leader].mains.slice(), modulars: MC_CW.LEADERS[leader].modulars.slice(0, 3) };
+}
+function leaderTitle(set) { const c = MC.D.cards.find((x) => x.set === set && x.isLeader); return c ? c.nameEn : ''; }
+function renderPvpSetup(ds, modeTabs) {
+  const st = UI.pvpState || (UI.pvpState = { registration: pvpTeamDefault('registration', ds), resistance: pvpTeamDefault('resistance', ds), expert: false });
+  const mods = DK.modulars();
+  const team = (side) => {
+    const T = st[side]; const opts = MC_CW.mainOptions(side);
+    const lead = MC.D.sets.find((x) => x.code === T.leader);
+    return h('section', { class: 'panel pvpteam ' + side },
+      h('h3', {}, (side === 'registration' ? '🛡 ' : '✊ ') + MC_PVP.SIDE_ES[side]),
+      h('div', { class: 'row gap wrap' }, h('span', {}, 'Lo juega: '),
+        [['human', 'Persona'], ['bot', 'Bot']].map(([k, l]) => h('button', { class: 'btn small' + (T.ctrl === k ? ' primary' : ''), onclick: () => { T.ctrl = k; render(); } }, l))),
+      h('div', { class: 'muted' }, 'Héroes del equipo (1 o 2):'),
+      T.decks.map((id, i) => h('div', { class: 'row gap' },
+        h('select', { class: 'grow', onchange: (e) => { T.decks[i] = e.target.value; render(); } }, ds.map((d) => h('option', { value: d.id, selected: d.id === id }, d.name))),
+        T.decks.length > 1 ? h('button', { class: 'btn tiny', onclick: () => { T.decks.splice(i, 1); render(); } }, '✕') : null)),
+      T.decks.length < 2 ? h('button', { class: 'btn small', onclick: () => { T.decks.push(ds[Math.min(T.decks.length, ds.length - 1)].id); render(); } }, '+ Añadir héroe') : null,
+      h('div', { class: 'muted', style: { marginTop: '8px' } }, 'Tu líder (lo enfrentará el equipo rival):'),
+      h('div', { class: 'row gap wrap' }, PVP_LEADERS[side].map((l) => h('button', { class: 'vtile' + (T.leader === l ? ' on' : ''), 'data-set': l, onclick: () => { T.leader = l; T.mains = MC_CW.LEADERS[l].mains.slice(); T.modulars = MC_CW.LEADERS[l].modulars.slice(0, 3); render(); } }, iconImg(l), h('span', {}, (MC.D.sets.find((x) => x.code === l) || {}).name || l)))),
+      h('div', { class: 'muted' }, 'Planes principales que enfrentará el rival:'),
+      [1, 2].map((n) => h('div', { class: 'row gap' }, h('span', {}, 'Etapa ' + n + ': '),
+        h('select', { onchange: (e) => { T.mains[n - 1] = e.target.value; render(); } }, opts[n].map((o) => h('option', { value: o.base, selected: T.mains[n - 1] === o.base }, o.name))))),
+      h('div', { class: 'muted' }, 'Módulos (3 o 4 de tu bando): ' + T.modulars.length),
+      h('div', { class: 'vgrid mods' }, MC_CW.MODS[side].map((m) => h('button', { class: 'vtile mod' + (T.modulars.includes(m) ? ' on' : ''), 'data-set': m, onclick: () => { const on = T.modulars.includes(m); T.modulars = T.modulars.filter((x) => x !== m); if (!on) { if (T.modulars.length >= 4) { toast('Máximo 4 módulos.', 'bad'); } else T.modulars.push(m); } render(); } },
+        iconImg(m), h('span', {}, (mods.find((x) => x.set === m) || {}).name || m), T.modulars.includes(m) ? h('i', { class: 'vcheck' }, '✓') : null))),
+      h('button', { class: 'btn small', onclick: () => { const r = (a) => a[Math.floor(Math.random() * a.length)]; T.leader = r(PVP_LEADERS[side]); T.mains = [r(opts[1]).base, r(opts[2]).base]; T.modulars = MC_CW.MODS[side].slice().sort(() => Math.random() - 0.5).slice(0, 3 + Math.floor(Math.random() * 2)); render(); } }, '🎲 Escenario aleatorio'),
+      lead ? null : null);
+  };
+  const start = () => {
+    const errs = [];
+    for (const side of ['registration', 'resistance']) {
+      const T = st[side];
+      const sel = T.decks.map((id) => ds.find((d) => d.id === id)).filter(Boolean);
+      if (new Set(sel.map((d) => d.heroSet)).size !== sel.length) errs.push(MC_PVP.SIDE_ES[side] + ': cada jugador debe usar un héroe distinto.');
+      const lt = leaderTitle(T.leader);
+      for (const d of sel) { const hc = MC.CARDS[heroCodeOf(d.heroSet)]; if (hc && lt && hc.nameEn === lt) errs.push(MC_PVP.SIDE_ES[side] + ': no podéis usar a ' + hc.name + ' si es vuestro líder.'); }
+      if (T.modulars.length < 3) errs.push(MC_PVP.SIDE_ES[side] + ': elige 3 o 4 módulos.');
+    }
+    if (st.registration.ctrl === 'bot' && st.resistance.ctrl === 'bot') errs.push('Al menos un equipo debe jugarlo una persona.');
+    if (errs.length) { uiAlert(errs.join('\n')); return; }
+    startPvp(st, ds);
+  };
+  return h('main', { class: 'page newgame' },
+    h('h2', {}, 'Nueva partida'), modeTabs,
+    h('p', { class: 'muted' }, 'Dos equipos, Registro contra Resistencia. Cada equipo prepara un escenario (líder, planes y módulos) que jugará el equipo rival. Gana quien derrote antes al líder enemigo, o el equipo cuyo líder complete su plan 2B o derrote a todos los héroes rivales. Orden de cada ronda: héroes de Registro → héroes de Resistencia → villano de Registro → villano de Resistencia.'),
+    h('div', { class: 'grid2' }, team('registration'), team('resistance')),
+    h('div', { class: 'row gap' }, h('label', { class: 'chk' }, h('input', { type: 'checkbox', checked: st.expert, onchange: (e) => { st.expert = e.target.checked; } }), ' Experto (líderes III y IV)')),
+    h('div', { class: 'row gap' }, h('button', { class: 'btn big primary', onclick: start }, '⚔ ¡A la guerra civil!')));
+}
+function startPvp(st, ds) {
+  const teamCfg = (side) => {
+    const T = st[side];
+    const players = T.decks.map((id) => ds.find((d) => d.id === id)).filter(Boolean).map((d) => ({ heroSet: d.heroSet, deck: d.deck, aspects: d.aspects, deckName: d.name }));
+    return { players, leader: T.leader, mains: T.mains.slice(), modulars: T.modulars.slice() };
+  };
+  UI.rivalLog = [];
+  const ioFor = (side) => {
+    if (st[side].ctrl === 'bot') {
+      let gref = null;
+      const io = MC_BOT.makeIO({ game: () => gref, onLog: (m, k) => { UI.rivalLog.push({ m, k, side }); if (UI.rivalLog.length > 300) UI.rivalLog.shift(); }, onUpdate: () => renderSoon() });
+      io.bind = (g) => { gref = g; };
+      return io;
+    }
+    const io = makeIO();
+    io.save = null;
+    io.gameOver = () => render();
+    return io;
+  };
+  const m = new MC_PVP.Match({ registration: teamCfg('registration'), resistance: teamCfg('resistance'), expert: st.expert, ioFor });
+  for (const side of ['registration', 'resistance']) { const g = m.games[side]; if (g.io.bind) g.io.bind(g); g.pvpHuman = st[side].ctrl === 'human'; }
+  const humans = ['registration', 'resistance'].filter((s) => st[s].ctrl === 'human');
+  UI.match = m; UI.g = m.games[humans[0]]; UI.stack = []; UI.turn = null; UI.nodes.clear(); UI.focusP = null;
+  m.listeners.push(async (ev, x) => {
+    if (ev === 'phase' && x.game.pvpHuman && UI.g !== x.game) {
+      UI.g = x.game; UI.stack = []; UI.turn = null; UI.nodes.clear(); UI.focusP = null; render();
+      if (humans.length > 1) await new Promise((res) => pushPrompt({ kind: 'phase', q: { title: 'Turno del equipo de ' + MC_PVP.SIDE_ES[x.side], sub: 'Pasad el dispositivo al otro equipo', kind: 'stage' } }, res));
+    }
+    if (ev === 'end') { recordHistory(UI.g, x.winner && humans.includes(x.winner) ? 'win' : 'loss'); toast((x.winner ? '⚔ Gana ' + MC_PVP.SIDE_ES[x.winner] + '. ' : '') + x.why, x.winner && humans.includes(x.winner) ? 'good' : 'bad', 10000); }
+    render();
+  });
+  setScreen('board');
+  m.run().catch((e) => { console.error(e); toast('Error del motor: ' + e.message, 'bad'); });
+}
+let _rsoon = null;
+function renderSoon() { if (_rsoon) return; _rsoon = setTimeout(() => { _rsoon = null; render(); }, 120); }
+function pvpStatusPills(g) {
+  const M = UI.match; const r = M.result;
+  if (r) return h('span', { class: 'pill ' + (r.winner === g.pvp.side ? 'green' : r.winner ? 'red' : 'gold') }, r.winner ? (r.winner === g.pvp.side ? '¡VICTORIA DE ' : 'GANA ') + MC_PVP.SIDE_ES[r.winner].toUpperCase() + (r.winner === g.pvp.side ? '!' : '') : r.both ? 'AMBOS PIERDEN' : 'EMPATE');
+  if (g.over) return h('span', { class: 'pill gold' }, 'Tu mesa terminó: el rival juega su fase');
+  return h('span', { class: 'pill ' + (g.pvp.side === 'registration' ? 'blue' : 'red') }, '⚔ ' + MC_PVP.SIDE_ES[g.pvp.side]);
+}
+function renderPvpBar(g) {
+  const M = UI.match; const o = g.pvp.other(); const cur = M.current || {};
+  const v = o.villain(); const m = o.main();
+  const rival = [
+    v ? (o.name(v) + ' ' + Math.max(0, o.hpLeft(v)) + '/' + o.maxHp(v) + ' ❤') : 'sin líder',
+    m ? (o.name(m) + ' ' + m.thr + '/' + (o.threshold(m) || '–') + ' ⚠') : '',
+    o.players.map((p) => p.name + (p.alive ? ' ' + Math.max(0, o.hpLeft(o.idOf(p))) + '❤' : ' ✝')).join(' · '),
+  ].filter(Boolean).join(' — ');
+  const lastLogs = (UI.rivalLog || []).slice(-4).map((x) => x.m);
+  return h('div', { class: 'pvpbar' },
+    h('span', { class: 'pill' }, 'Ronda ' + M.round + ' · ' + (cur.side ? (cur.kind === 'setup' ? 'Preparación' : cur.kind === 'player' ? 'Héroes' : 'Villano') + ' de ' + MC_PVP.SIDE_ES[cur.side] : '')),
+    h('span', { class: 'pvprival', title: 'Mesa del equipo rival (' + MC_PVP.SIDE_ES[o.pvp.side] + ')' }, '👁 Rival (' + MC_PVP.SIDE_ES[o.pvp.side] + '): ' + rival + (o.over ? ' — ' + (o.over.win ? 'ha derrotado a su líder' : 'ha caído') : '')),
+    M.result ? h('div', { class: 'pvpresult' }, h('b', {}, M.result.why), ' ', h('button', { class: 'btn small primary', onclick: () => { UI.g = null; UI.match = null; setScreen('new'); } }, 'Volver')) : null,
+    lastLogs.length && !o.pvpHuman ? h('div', { class: 'pvplog muted' }, lastLogs.join(' · ')) : null);
 }
 function startGame({ st, stages }) {
   const ds = allDecks();
@@ -17962,10 +18551,11 @@ function renderStatusBar(g, canAct, turnP) {
       !g.over && !UI.turn && NET.role !== 'guest' ? h('button', { class: 'btn small' + (g.pauseRequested ? ' on' : ''), title: 'Detiene el motor en la siguiente ventana para que uses herramientas manuales o juegues cartas a mano', onclick: () => { g.pauseRequested = !g.pauseRequested; render(); } }, g.pauseRequested ? '⏸ Pausa pedida' : '⏸ Pausar') : null,
       UI.turn && !UI.turn.remote ? undoBtn(g, canAct, 'btn') : null,
       UI.turn && !UI.turn.remote ? h('button', { class: 'btn primary', disabled: !canAct, onclick: async () => { if (canAct && await uiConfirm('¿Terminar el turno de ' + UI.turn.p.name + '?')) UI.turn.resolve(); } }, 'Fin de turno') : null,
-      g.over ? h('span', { class: 'pill ' + (g.over.win ? 'green' : 'red') }, g.over.win ? '¡VICTORIA!' : 'DERROTA') : null,
+      UI.match ? pvpStatusPills(g) : g.over ? h('span', { class: 'pill ' + (g.over.win ? 'green' : 'red') }, g.over.win ? '¡VICTORIA!' : 'DERROTA') : null,
       g.over && g.cfg.campaign ? h('button', { class: 'btn primary', onclick: () => { UI.g = null; setScreen('campaign'); } }, 'Volver a la campaña') : null,
       NET.role === 'guest' ? h('button', { class: 'btn small', onclick: async () => { if (await uiConfirm('¿Salir de la sala online?')) { netDisconnect(); UI.g = null; UI.stack = []; UI.turn = null; setScreen('online'); } } }, 'Salir') :
-      h('button', { class: 'btn small', onclick: async () => { if (await uiConfirm('¿Abandonar la partida?')) { if (!UI.g.over) recordHistory(UI.g, 'abandon'); UI.g = null; store.del('save'); setScreen('home'); } } }, 'Salir')));
+      h('button', { class: 'btn small', onclick: async () => { if (await uiConfirm('¿Abandonar la partida?')) { if (!UI.g.over && !UI.match) recordHistory(UI.g, 'abandon'); UI.g = null; UI.match = null; store.del('save'); setScreen('home'); } } }, 'Salir')),
+    UI.match ? renderPvpBar(g) : null);
 }
 function zoneRow(title, cards, opts = {}) {
   return h('div', { class: 'zone ' + (opts.cls || '') },
