@@ -709,6 +709,12 @@ body.guided .cmenu .mitem.act:not([disabled]) { outline: 2px solid #2ecc71; back
 .gpanel .coachhead { cursor: pointer; }
 .gpanel.min { cursor: pointer; padding: 6px 10px; }
 body.guided .card.playable:not(.tut-glow), body.guided .card.usable:not(.tut-glow) { box-shadow: none; }
+/* cartas de potenciación bocabajo guardadas sobre una carta */
+.ovl .fdb { position: absolute; right: -8px; top: 26%; width: 34px; height: 44px; pointer-events: auto; cursor: help; z-index: 3; }
+.ovl .fdb i { position: absolute; right: calc(var(--k) * 4px); top: calc(var(--k) * 3px); width: 26px; height: 36px; border-radius: 3px; border: 1px solid #6b2b31; background: repeating-linear-gradient(45deg, #5a2228 0 4px, #3a1418 4px 8px); box-shadow: 0 1px 4px rgba(0,0,0,.6); transform: rotate(8deg); }
+.ovl .fdb b { position: absolute; right: -2px; bottom: -8px; font-size: 10.5px; padding: 0 4px; border-radius: 5px; background: #b11d1d; color: #fff; border: 1px solid rgba(255,255,255,.3); white-space: nowrap; animation: fdbpop .5s ease-out; }
+@keyframes fdbpop { from { transform: scale(1.8); } to { transform: scale(1); } }
+.fdbnote { color: #ffb3b3; }
 
 /* Tema «cómic nocturno»: azul marino profundo, títulos amarillos con tipografía de cómic y acentos cian. */
 :root {
@@ -28559,8 +28565,15 @@ function cardNode(ci, o = {}) {
     status.push(h('span', { class: 'cost' }, c == null ? '—' : c < 0 ? 'X' : String(c)));
   }
   const fst = !ci.faceDown && d.text ? FX.get(ci.code).status : null;
-  ov.replaceChildren(...[h('div', { class: 'ov-top' }, status), h('div', { class: 'ov-bot' }, chips), fst && fst !== 'auto' ? h('span', { class: 'st st-' + fst, title: fst === 'manual' ? 'Efecto manual' : 'Efecto parcialmente automático' }) : null].filter(Boolean));
+  const nfb = g.inPlay(ci) && ci.x && ci.x.fdBoost > 0 ? ci.x.fdBoost : 0;
+  const fdb = nfb ? h('div', { class: 'fdb', title: fdBoostWhy(g, ci, nfb) }, ...Array.from({ length: Math.min(nfb, 5) }, (_, i) => h('i', { style: { '--k': i } })), h('b', {}, '⚡×' + nfb)) : null;
+  ov.replaceChildren(...[h('div', { class: 'ov-top' }, status), h('div', { class: 'ov-bot' }, chips), fdb, fst && fst !== 'auto' ? h('span', { class: 'st st-' + fst, title: fst === 'manual' ? 'Efecto manual' : 'Efecto parcialmente automático' }) : null].filter(Boolean));
   return el;
+}
+function fdBoostWhy(g, ci, n) {
+  const who = g.isIdentity(ci) ? 'sobre tu identidad' : 'sobre ' + g.name(ci);
+  const use = g.isIdentity(ci) ? 'Se resuelven según la carta que las colocó (p. ej. Veneno se las lleva al activarse contra ti).' : 'Se sumarán como potenciación a su próxima activación (ataque o plan).';
+  return n + ' carta' + (n === 1 ? '' : 's') + ' de potenciación bocabajo ' + who + '. ' + use;
 }
 // Título con los nombres de carta resaltados (vista previa al pasar el ratón)
 function linkTitle(title, codes) {
@@ -28734,6 +28747,7 @@ function openCardMenu(e, ci) {
       ci.faceDown ? null : h('div', { class: 'muted' }, (MC.TYPE_ES[d.type] || d.type) + (d.traits ? ' · ' + d.traits : '') + (d.boost ? ' · ' + '⚡'.repeat(d.boost) : '')),
       ci.faceDown ? null : h('div', { class: 'ctext', html: richText(d.text || '') }),
       ci.faceDown ? null : kwLegend(d),
+      ci.x && ci.x.fdBoost > 0 && g.inPlay(ci) ? h('div', { class: 'mnote fdbnote' }, '⚡ ' + fdBoostWhy(g, ci, ci.x.fdBoost)) : null,
       !ci.faceDown && f.manualText ? h('div', { class: 'mnote' }, 'Manual: ' + f.manualText.slice(0, 260)) : null,
       acts.length ? h('div', { class: 'acts' }, acts) : null,
       tools ? h('details', { class: 'tools', open: !acts.length && !!g.inPlay(ci) }, h('summary', {}, 'Herramientas manuales'), tools) : null));
