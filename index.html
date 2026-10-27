@@ -3620,7 +3620,8 @@ function parseKeywords(text) {
   if (!text) return kw;
   const main = text.split(/<hr\s*\/?>/i)[0];
   for (const rawLine of main.split('\n')) {
-    const line = stripTags(rawLine);
+    // el texto recordatorio entre paréntesis tras una palabra clave ("Toughness. (This character…)") no cuenta
+    const line = stripTags(rawLine.replace(/\.\s*\([^()]*\)/g, '.'));
     if (!line) continue;
     const parts = line.split(/\.\s*/).map((s) => s.trim()).filter(Boolean);
     if (!parts.length || !parts.every((x) => KW_RE.test(x))) continue;
