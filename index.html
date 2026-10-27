@@ -1509,6 +1509,7 @@ class Game {
       (byStage[num] = byStage[num] || {})[side] = c.code;
     }
     this.mainStages = Object.keys(byStage).sort((a, b) => a - b).map((k) => byStage[k]).filter((s) => s.b || s.a);
+    if (this.FX.mainStageOverride && this.FX.mainStageOverride[vset]) this.mainStages = this.FX.mainStageOverride[vset](cfg.expert);
     if (cfg.mainStages && cfg.mainStages.length) this.mainStages = cfg.mainStages;
 
     // jugadores
@@ -2210,7 +2211,7 @@ class Game {
   }
   canRemoveThreat(scheme) {
     if (!scheme) return false;
-    if (scheme.zone === 'main' && this.crisis() && !this.ignoreCrisisNow && !(this.phase === 'player' && this.ignores(this.players[this.active], 'ignoreCrisis'))) return false;
+    if ((scheme.zone === 'main' || (scheme.zone === 'main2' && this.glider)) && this.crisis() && !this.ignoreCrisisNow && !(this.phase === 'player' && this.ignores(this.players[this.active], 'ignoreCrisis'))) return false;
     const f = this.fx(scheme);
     if (f.noThreatRemoval && f.noThreatRemoval(this, scheme)) return false;
     if (this.allInPlay().some((c) => c !== scheme && !c.faceDown && this.fx(c).blockRemoval && this.fx(c).blockRemoval(this, c, scheme))) return false;
@@ -2245,6 +2246,7 @@ class Game {
     const t = this.threshold(m);
     if (!(t > 0 && m.thr >= t)) return;
     const f = this.fx(m);
+    if (f.onComplete) { await f.onComplete(this, m); this.update(); return; }
     this.log('El plan «' + this.name(m) + '» se completa.', 'bad');
     m.thr = f.completeClear ? 0 : this.scaled(this.d(m).baseThreat || 0, this.d(m).baseThreatFixed);
     if (f.whenCompleted) await f.whenCompleted(this, m);
@@ -2256,6 +2258,7 @@ class Game {
     const t = this.threshold(m);
     if (t > 0 && m.thr >= t) {
       const f = this.fx(m);
+      if (f.onComplete) { await f.onComplete(this, m); this.update(); return; }
       if (f.completeLose) {
         this.finish(false, 'El plan principal "' + this.d(m).name + '" se ha completado.');
         throw new GameOver(false, this.over.msg);
@@ -2417,7 +2420,7 @@ class Game {
     if (ctx.heroDefended) dmg -= defVal;
     const target = ctx.defender && this.inPlay(ctx.defender) ? ctx.defender : (this.inPlay(id) ? id : null);
     if (ctx.preventAllDamage) this.log('Se evita todo el daño del ataque.');
-    if (dmg > 0 && target && !ctx.preventAllDamage && this.fx(enemy).indirectAttack) {
+    if (dmg > 0 && target && !ctx.preventAllDamage && (this.fx(enemy).indirectAttack || ctx.indirect)) {
       this.log('El ataque de ' + this.name(enemy) + ' inflige ' + dmg + ' de daño indirecto.');
       await root.MC_FX.L.indirect(this, p, dmg); ctx.damageDealt = dmg; ctx.damaged = this.idOf(p);
     } else if (dmg > 0 && target && !ctx.preventAllDamage && ctx.divide) {
@@ -3173,7 +3176,7 @@ class Game {
     return this.stat(c, 'thw');
   }
   thwartableSchemes(p) {
-    return this.schemes().filter((s) => (s.zone !== 'main' || !this.blockedFromMain(p)) && this.canRemoveThreat(s) && s.thr > 0);
+    return this.schemes().filter((s) => ((s.zone !== 'main' && s.zone !== 'main2') || !this.blockedFromMain(p)) && this.canRemoveThreat(s) && s.thr > 0);
   }
   attackableEnemies(p, o = {}) {
     let list = this.enemies();
@@ -3401,7 +3404,7 @@ class Game {
     for (const k of Object.keys(this.Z)) if (!s.Z[k]) this.Z[k].length = 0;
     for (const [k, arr] of Object.entries(s.Z)) { if (this.Z[k]) this.Z[k].splice(0, this.Z[k].length, ...arr); else this.Z[k] = arr; }
     s.players.forEach((sp, i) => { if (this.players[i]) sync(this.players[i], sp); });
-    for (const k of ['nextId', 'round', 'phase', 'first', 'active', 'mods', 'traitMods', 'limits', 'accelTokens', 'logs', 'villainStages', 'vIdx', 'mainStages', 'mIdx', 'blankTech', 'techRound', 'multiMode', 'encDecks', 'encOwner']) this[k] = s[k];
+    for (const k of ['nextId', 'round', 'phase', 'first', 'active', 'mods', 'traitMods', 'limits', 'accelTokens', 'logs', 'villainStages', 'vIdx', 'mainStages', 'mIdx', 'blankTech', 'techRound', 'multiMode', 'encDecks', 'encOwner', 'glider']) this[k] = s[k];
     this.cOut = pt.cOut; this.delayed = pt.delayed; this.deferred = pt.deferred; this.ssDeck = pt.ssDeck;
     this.over = null; this.attackCtx = null;
     this.log('↶ Se deshace la última jugada.', 'warn');
@@ -3438,7 +3441,7 @@ class Game {
   snapshot() {
     const s = {};
     for (const k of ['nextId', 'C', 'Z', 'players', 'round', 'phase', 'first', 'active', 'mods', 'traitMods', 'limits',
-      'accelTokens', 'over', 'logs', 'villainStages', 'vIdx', 'mainStages', 'mIdx', 'cfg', 'blankTech', 'techRound', 'multiMode', 'encDecks', 'encOwner']) s[k] = this[k];
+      'accelTokens', 'over', 'logs', 'villainStages', 'vIdx', 'mainStages', 'mIdx', 'cfg', 'blankTech', 'techRound', 'multiMode', 'encDecks', 'encOwner', 'glider']) s[k] = this[k];
     return JSON.parse(JSON.stringify(s));
   }
   static fromSnapshot(s, io) {
@@ -10398,6 +10401,74 @@ R('45092', horsemanOf(0)); R('45093', horsemanOf(1)); R('45094', horsemanOf(2));
 R('45096', { whenRevealed: async (g, ci, p) => { await resolveFR(g, V(g), p); await nextHorse(g); await resolveFR(g, V(g), p); } });
 const hSS = (fn) => ({ whenDefeated: async (g, ci, ctx) => { const q = ctx.player || g.firstPlayer(); await fn(g, q); } });
 R('45086', hSS(HFR[0])); R('45087', hSS(HFR[1])); R('45088', hSS(HFR[2])); R('45089', hSS(HFR[3]));
+
+// ===================== DUENDE VENENO (tres planes principales) =====================
+const MAINS = { '27117a': 'Lower', '27118a': 'Midtown', '27119a': 'Upper' };
+const mainsInPlay = (g) => [...g.cards('main'), ...g.cards('main2')].filter((c) => MAINS[c.code]);
+const symEnvs = (g) => g.cards('env').filter((c) => !c.faceDown && g.hasTrait(c, 'Symbiote')).length;
+const symActive = (g) => symEnvs(g) > 0 || g.sideSchemes().some((c) => c.code === '27124');
+FX.mainStageOverride = FX.mainStageOverride || {};
+FX.mainStageOverride.venom_goblin = () => [{ a: '27116a' }];
+FX.scenarioNote.venom_goblin = 'Tres planes principales a la vez (Bajo, Centro y Alto Manhattan). Los efectos de encuentro solo afectan al plan con el contador de planeador; las cartas de jugador pueden afectar a cualquiera. Si 2 planes se completan y pasan a ser entornos Simbionte, perdéis.';
+async function moveGlider(g, target, why) {
+  const old = g.main();
+  if (!target || target === old) return;
+  if (old) { old.x.acc = g.accelTokens; g.put(old, 'main2'); }
+  g.put(target, 'main');
+  g.accelTokens = target.x.acc || 0; target.x.acc = 0;
+  g.log('El contador de planeador pasa a ' + g.name(target) + (why ? ' (' + why + ')' : '') + '.', 'phase');
+  g.update();
+  await g.phaseFx('Planeador: ' + g.name(target), why || '', 'stage');
+}
+const leastMain = (g) => pickTie(g, mainsInPlay(g), 'Plan principal con menos amenaza', (m) => -m.thr);
+const mostMain = (g) => pickTie(g, mainsInPlay(g), 'Plan principal con más amenaza', (m) => m.thr);
+const SPECIAL = {
+  '27117a': async (g, m) => { for (const s of g.schemes().slice()) await g.placeThreat(s, 1); if (symActive(g) && g.inPlay(m)) await g.placeThreat(m, 1); },
+  '27118a': async (g, m, p) => L.indirect(g, p, 2 + (symActive(g) ? 1 : 0)),
+  '27119a': async (g, m, p) => { const h = g.cards(g.pz(p, 'hand')); if (h.length) { const c = await g.pickOne('Alto Manhattan: descarta 1 carta de tu mano', h, { player: p.idx }); if (c) { g.put(c, g.pz(p, 'discard')); g.log(p.name + ' descarta ' + g.d(c).name + '.'); } } if (symActive(g)) await g.discardTop(p, 4); },
+};
+async function special(g, p) { const m = g.main(); if (!m || !SPECIAL[m.code] || !p || !p.alive) return; g.log('Se resuelve la habilidad «Especial» de ' + g.name(m) + '.', 'bad'); await g.withSource(m, 'Especial', () => SPECIAL[m.code](g, m, p)); }
+async function flipMain(g, m) {
+  const wasGlider = m.zone === 'main';
+  const carried = wasGlider ? g.accelTokens : (m.x.acc || 0);
+  g.log('¡El plan «' + g.name(m) + '» se completa y se convierte en un entorno Simbionte!', 'bad');
+  m.code = m.code.replace(/a$/, 'b'); m.thr = 0; m.x.acc = 0;
+  g.put(m, 'env');
+  if (wasGlider) g.accelTokens = 0;
+  g.update();
+  await g.phaseFx('Manhattan cae', g.name(m) + ' ahora es un entorno Simbionte (' + symEnvs(g) + '/2)', 'stage');
+  if (symEnvs(g) >= 2) { g.finish(false, 'Hay 2 entornos Simbionte en juego: el Duende Veneno domina Nueva York.'); throw new MC.GameOver(false, g.over.msg); }
+  const t = await leastMain(g);
+  if (!t) { g.finish(false, 'No quedan planes principales.'); throw new MC.GameOver(false, g.over.msg); }
+  if (wasGlider) { await moveGlider(g, t, 'el plan anterior cayó'); g.accelTokens += carried; }
+  else if (t.zone === 'main') g.accelTokens += carried; else t.x.acc = (t.x.acc || 0) + carried;
+  if (carried) g.log('Se mueven ' + carried + ' ficha(s) de aceleración a ' + g.name(t) + '.');
+}
+R('27116a', { setup: async (g) => {
+  const m = g.main();
+  m.code = '27118a';
+  for (const code of ['27117a', '27119a']) { const c = g.mk(code, null, 'main2'); c.thr = g.scaled(g.d(c).baseThreat || 0, g.d(c).baseThreatFixed); }
+  g.glider = true;
+  for (const x of [...g.cards('enc.deck'), ...g.cards('enc.discard')].filter((x) => ['27116b', '27117b', '27118b', '27119b'].includes(x.code))) g.put(x, 'removed');
+  g.log(mainsInPlay(g).map((c) => g.name(c)).join(', ') + ' entran en juego. El contador de planeador empieza en ' + g.name(m) + '.', 'phase');
+} });
+R(Object.keys(MAINS), { onComplete: async (g, m) => flipMain(g, m),
+  on: { afterStep1: [{ cond: (g, ci) => ci.zone === 'main2', run: async (g, ci) => { const n = g.escalation(ci) + (ci.x.acc || 0); if (n) await g.placeThreat(ci, n, { step1: true }); } }] } });
+R(['27117b', '27118b', '27119b'], {});
+const vgResp = (fn) => ({ on: { afterEnemyActivation: [{ cond: (g, ci, ctx) => ctx.enemy === ci && ctx.player && ctx.player.alive && g.inPlay(ci), run: async (g, ci, ctx) => { const t = await leastMain(g); if (t) await moveGlider(g, t, 'el plan principal con menos amenaza'); await fn(g, ctx.player); } }] } });
+R('27113', vgResp(async (g, p) => L.chooseOne(g, p, 'Infestar la ciudad', [
+  { label: 'Poner 2 de amenaza en ' + g.name(g.main()), run: async () => g.placeThreat(g.main(), 2) },
+  { label: 'Resolver su habilidad «Especial»', run: async () => special(g, p) }])));
+R('27114', { ...vgResp(special), whenRevealed: async (g) => { for (const q of g.order()) await g.dealEncounter(q, 2); } });
+R('27115', { ...vgResp(async (g, p) => { await g.placeThreat(g.main(), 1); await special(g, p); }), whenRevealed: async (g) => { for (const q of g.order()) await g.dealEncounter(q, 3); } });
+R('27120', { attachHost: async (g) => V(g), abilities: [{ kind: 'action', label: 'Gastar [energía][mental][físico] → descartar esta carta', heroOnly: true, cost: { types: { energy: 1, mental: 1, physical: 1 } }, run: async (g, ci) => g.discard(ci) }] });
+R('27121', { grantKw: (g, src, tgt) => (tgt === src && g.inPlay(src) && symActive(g) ? { quickstrike: true } : null),
+  boost: async (g) => { const t = await mostMain(g); if (t) { await moveGlider(g, t, 'el plan principal con más amenaza'); await g.placeThreat(t, 1); } } });
+R('27122', { stat: (g, src, tgt, s) => (tgt === src && s === 'hp' && g.inPlay(src) && symActive(g) ? 3 : 0), boost: async (g, ci, ctx) => { if (ctx.attack) { ctx.indirect = true; g.log('El ataque inflige daño indirecto.'); } } });
+R('27123', { grantKw: (g, src, tgt) => (tgt === src && g.inPlay(src) && symActive(g) ? { patrol: true } : null), boost: async (g) => { for (const m of g.cards('main2')) await g.placeThreat(m, 1); } });
+R('27124', { boost: async (g, ci, ctx) => { ctx.boostCards = ctx.boostCards.filter((b) => b !== ci); g.resetCard(ci); await g.reveal(ci, ctx.player || g.firstPlayer()); } });
+R('27125', { whenRevealed: async (g, ci, p) => { const t = await mostMain(g); if (t) await moveGlider(g, t, 'el plan principal con más amenaza'); await special(g, p); } });
+R('27126', { whenRevealed: async (g, ci, p) => special(g, p), boost: async (g, ci, ctx) => special(g, ctx.player || g.firstPlayer()) });
 })(typeof window !== 'undefined' ? window : globalThis);
 
 </script>
@@ -12032,8 +12103,8 @@ function renderVillainArea(g) {
     h('div', { class: 'va-left' },
       zoneRow(g.z('villain2').length ? 'Villano activo' : 'Villano', [v ? cardNode(v, { big: true }) : null, ...vAtt].filter(Boolean), { cls: 'vz' }),
       g.z('villain2').length ? zoneRow(g.z('villain2').length > 1 ? 'Villanos inactivos' : 'Villano inactivo', g.cards('villain2').flatMap((x) => [cardNode(x, { big: true }), ...g.attachments(x).map((a) => cardNode(a))]), { cls: 'vz' }) : null,
-      zoneRow(g.z('main2').length ? 'Plan del villano activo' : 'Plan principal' + (m ? ' (etapa ' + (g.mIdx + 1) + '/' + g.mainStages.length + ')' : ''), m ? [h('div', { class: 'mstack' }, cardNode(m, { big: true }), g.accelTokens ? h('div', { class: 'acceltoks under', title: g.accelTokens + ' ficha(s) de Aceleración: +' + g.accelTokens + ' de amenaza en cada paso 1' }, Array.from({ length: Math.min(g.accelTokens, 6) }, () => h('span', { class: 'tok accel', 'data-icon': 'accelToken' })), h('b', {}, '×' + g.accelTokens + ' aceleración')) : null), ...g.attachments(m).map((a) => cardNode(a))].filter(Boolean) : [], { cls: 'mz' }),
-      g.z('main2').length ? zoneRow('Plan del villano inactivo', g.cards('main2').flatMap((x) => [cardNode(x, { big: true }), ...g.attachments(x).map((a) => cardNode(a))]), { cls: 'mz' }) : null),
+      zoneRow(g.glider ? '🪂 Plan con el planeador' : g.z('main2').length ? 'Plan del villano activo' : 'Plan principal' + (m ? ' (etapa ' + (g.mIdx + 1) + '/' + g.mainStages.length + ')' : ''), m ? [h('div', { class: 'mstack' }, cardNode(m, { big: true }), g.accelTokens ? h('div', { class: 'acceltoks under', title: g.accelTokens + ' ficha(s) de Aceleración: +' + g.accelTokens + ' de amenaza en cada paso 1' }, Array.from({ length: Math.min(g.accelTokens, 6) }, () => h('span', { class: 'tok accel', 'data-icon': 'accelToken' })), h('b', {}, '×' + g.accelTokens + ' aceleración')) : null), ...g.attachments(m).map((a) => cardNode(a))].filter(Boolean) : [], { cls: 'mz' }),
+      g.z('main2').length ? zoneRow(g.glider ? 'Otros planes principales' : 'Plan del villano inactivo', g.cards('main2').flatMap((x) => [cardNode(x, { big: true }), ...g.attachments(x).map((a) => cardNode(a))]), { cls: 'mz' }) : null),
     h('div', { class: 'va-right' },
       zoneRow('Planes secundarios', g.sideSchemes().map((s) => cardNode(s)), { empty: 'Ninguno' }),
       zoneRow('Entorno', [...g.cards('env').map((c) => h('div', { class: 'stack' }, cardNode(c), ...g.attachments(c).map((a) => cardNode(a))))], { empty: '—' }),
